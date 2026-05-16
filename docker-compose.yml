@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./secrets:/app/secrets:ro
+    environment:
+      - GOOGLE_SERVICE_ACCOUNT_FILE=/app/secrets/sa.json

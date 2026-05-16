@@ -1,0 +1,10 @@
+.env
+secrets/
+*.json
+!package*.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+*.log
