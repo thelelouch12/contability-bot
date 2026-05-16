@@ -267,33 +267,41 @@ class SheetsClient:
     # ------------------------------- hojas mensuales -------------------------------
 
     def _create_reporte_sheet(self) -> None:
-        ws = self._sh.add_worksheet(title=REPORTE_SHEET, rows=40, cols=6)
+        ws = self._sh.add_worksheet(title=REPORTE_SHEET, rows=40, cols=8)
         gid = ws.id
         T = TODAS_SHEET
+
+        def count_f(estado):
+            return (f'=IFERROR(IF(OR($B$5="";$B$5="(Todos)");'
+                    f'COUNTIFS(INDIRECT("{T}!E"&$B$3&":E"&$B$4);"{estado}");'
+                    f'COUNTIFS(INDIRECT("{T}!E"&$B$3&":E"&$B$4);"{estado}";INDIRECT("{T}!C"&$B$3&":C"&$B$4);$B$5));0)')
+
+        def sum_f(estado):
+            return (f'=IFERROR(IF(OR($B$5="";$B$5="(Todos)");'
+                    f'SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"{estado}");'
+                    f'SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"{estado}";INDIRECT("{T}!C"&$B$3&":C"&$B$4);$B$5));0)')
 
         ws.batch_update([
             {"range": "A1", "values": [["REPORTE PERSONALIZADO"]]},
             {"range": "A3:B3", "values": [["Desde fila #:", 2]]},
             {"range": "A4:B4", "values": [["Hasta fila #:", f"=COUNTA({T}!A:A)"]]},
-            {"range": "A6", "values": [["ESTADOS EN EL RANGO SELECCIONADO"]]},
-            {"range": "A7:C7", "values": [["Estado", "Cantidad", "Total"]]},
-            {"range": "A8:C8", "values": [["Exitosa",
-                f'=IFERROR(COUNTIFS(INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Exitosa");0)',
-                f'=IFERROR(SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Exitosa");0)']]},
-            {"range": "A9:C9", "values": [["Pendiente",
-                f'=IFERROR(COUNTIFS(INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Pendiente");0)',
-                f'=IFERROR(SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Pendiente");0)']]},
-            {"range": "A10:C10", "values": [["Fallida",
-                f'=IFERROR(COUNTIFS(INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Fallida");0)',
-                f'=IFERROR(SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Fallida");0)']]},
-            {"range": "A11:C11", "values": [["TOTAL", "=SUM(B8:B10)", "=SUM(C8:C10)"]]},
-            {"range": "A13", "values": [["CÁLCULO INGRESO NETO (sobre Exitosas)"]]},
-            {"range": "A14:B14", "values": [["Total Exitosas:", "=C8"]]},
-            {"range": "A15:B15", "values": [["Atrapado (a descontar):", 0]]},
-            {"range": "A16:B16", "values": [["INGRESO NETO:", "=B14-B15"]]},
-            {"range": "A18", "values": [["COMISIÓN A COBRAR"]]},
-            {"range": "A19:B19", "values": [["Comisión %:", 0]]},
-            {"range": "A20:B20", "values": [["Comisión a cobrar:", "=B14*B19/100"]]},
+            {"range": "A5:B5", "values": [["Remitente:", "(Todos)"]]},
+            {"range": "A7", "values": [["ESTADOS EN EL RANGO SELECCIONADO"]]},
+            {"range": "A8:C8", "values": [["Estado", "Cantidad", "Total"]]},
+            {"range": "A9:C9", "values": [["Exitosa", count_f("Exitosa"), sum_f("Exitosa")]]},
+            {"range": "A10:C10", "values": [["Pendiente", count_f("Pendiente"), sum_f("Pendiente")]]},
+            {"range": "A11:C11", "values": [["Fallida", count_f("Fallida"), sum_f("Fallida")]]},
+            {"range": "A12:C12", "values": [["TOTAL", "=SUM(B9:B11)", "=SUM(C9:C11)"]]},
+            {"range": "A14", "values": [["CÁLCULO INGRESO NETO (sobre Exitosas)"]]},
+            {"range": "A15:B15", "values": [["Total Exitosas:", "=C9"]]},
+            {"range": "A16:B16", "values": [["Atrapado (a descontar):", 0]]},
+            {"range": "A17:B17", "values": [["INGRESO NETO:", "=B15-B16"]]},
+            {"range": "A19", "values": [["COMISIÓN A COBRAR"]]},
+            {"range": "A20:B20", "values": [["Comisión %:", 0]]},
+            {"range": "A21:B21", "values": [["Comisión a cobrar:", "=B15*B20/100"]]},
+            # Helper oculto para el dropdown de remitentes
+            {"range": "F1", "values": [["(Todos)"]]},
+            {"range": "F2", "values": [[f'=IFERROR(UNIQUE(FILTER({T}!C2:C;{T}!C2:C<>""));"")']]},
         ], value_input_option="USER_ENTERED")
 
         NAVY = {"red": 0.20, "green": 0.32, "blue": 0.45}
@@ -311,28 +319,44 @@ class SheetsClient:
             }}
 
         self._sh.batch_update({"requests": [
+            # Título
             {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 4}, "mergeType": "MERGE_ALL"}},
             repeat(0, 1, 0, 4, {"backgroundColor": NAVY, "textFormat": {"foregroundColor": WHITE, "bold": True, "fontSize": 14}, "horizontalAlignment": "CENTER"}),
-            repeat(2, 4, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
-            repeat(2, 4, 1, 2, {"backgroundColor": INPUT_BG, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 5, "endRowIndex": 6, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
-            repeat(5, 6, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 12, "endRowIndex": 13, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
-            repeat(12, 13, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 17, "endRowIndex": 18, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
-            repeat(17, 18, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
-            repeat(6, 7, 0, 3, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}),
-            repeat(7, 11, 2, 3, {"numberFormat": CURRENCY}),
-            repeat(10, 11, 0, 3, {"textFormat": {"bold": True}, "backgroundColor": LIGHT_BLUE}),
-            repeat(13, 17, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
-            repeat(13, 14, 1, 2, {"numberFormat": CURRENCY, "textFormat": {"bold": True}}),
-            repeat(14, 15, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
-            repeat(15, 16, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
-            repeat(18, 20, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
-            repeat(18, 19, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": {"type": "NUMBER", "pattern": "0.##\"%\""}, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
-            repeat(19, 20, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
+            # Selector filas 3-5
+            repeat(2, 5, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
+            repeat(2, 5, 1, 2, {"backgroundColor": INPUT_BG, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
+            # Subheaders
+            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 6, "endRowIndex": 7, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
+            repeat(6, 7, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
+            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 13, "endRowIndex": 14, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
+            repeat(13, 14, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
+            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 18, "endRowIndex": 19, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
+            repeat(18, 19, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
+            # Header tabla
+            repeat(7, 8, 0, 3, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}),
+            # Currency col C filas 9-12
+            repeat(8, 12, 2, 3, {"numberFormat": CURRENCY}),
+            # Fila TOTAL
+            repeat(11, 12, 0, 3, {"textFormat": {"bold": True}, "backgroundColor": LIGHT_BLUE}),
+            # Ingreso neto
+            repeat(14, 18, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
+            repeat(14, 15, 1, 2, {"numberFormat": CURRENCY, "textFormat": {"bold": True}}),
+            repeat(15, 16, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
+            repeat(16, 17, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
+            # Comisión
+            repeat(19, 21, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
+            repeat(19, 20, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": {"type": "NUMBER", "pattern": "0.##\"%\""}, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
+            repeat(20, 21, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
+            # Anchos cols A B C D
             *[{"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": i, "endIndex": i+1}, "properties": {"pixelSize": w}, "fields": "pixelSize"}}
-              for i, w in enumerate([220, 160, 160, 20])],
+              for i, w in enumerate([220, 200, 160, 20])],
+            # Ocultar columna F (helper)
+            {"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 6}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
+            # Dropdown en B5
+            {"setDataValidation": {
+                "range": {"sheetId": gid, "startRowIndex": 4, "endRowIndex": 5, "startColumnIndex": 1, "endColumnIndex": 2},
+                "rule": {"condition": {"type": "ONE_OF_RANGE", "values": [{"userEnteredValue": f"={REPORTE_SHEET}!$F$1:$F$1000"}]}, "strict": True, "showCustomUi": True},
+            }},
         ]})
         logger.info("Hoja '%s' creada", REPORTE_SHEET)
 
