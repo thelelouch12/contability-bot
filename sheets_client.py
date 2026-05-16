@@ -97,7 +97,32 @@ class SheetsClient:
     def _format_transactions_sheet(self, ws: gspread.Worksheet) -> None:
         """Aplica todo el formato de una hoja de transacciones en 1 batch_update."""
         gid = ws.id
+        # Regla condicional: pintar fila amarilla si el código se repite (duplicado)
+        dup_rule = {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": gid,
+                        "startRowIndex": 1,
+                        "endRowIndex": 1000,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(HEADERS),
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": '=AND($F2<>"",$F2<>"N/A",COUNTIF($F:$F,$F2)>1)'}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 1.0, "green": 0.92, "blue": 0.6},
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        }
         requests = [
+            dup_rule,
             # Freeze header
             {
                 "updateSheetProperties": {
