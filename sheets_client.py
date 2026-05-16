@@ -72,19 +72,15 @@ class SheetsClient:
             ws = self._sh.add_worksheet(title=TODAS_SHEET, rows=1000, cols=len(HEADERS))
             ws.append_row(HEADERS, value_input_option="USER_ENTERED")
             existing[TODAS_SHEET] = ws
-        self._format_transactions_sheet(existing[TODAS_SHEET])
+            self._format_transactions_sheet(existing[TODAS_SHEET])
+        # No re-formatear si ya existe → ahorra cuota de Sheets API en restarts
 
-        # Recrear Resumen siempre (sin datos de usuario)
-        if RESUMEN_SHEET in existing:
-            self._sh.del_worksheet(existing[RESUMEN_SHEET])
-        self._create_resumen_sheet()
+        # Crear Resumen solo si no existe (las fórmulas son estables).
+        # Si quieres recrearlo, bórralo manualmente del Sheet y reinicia.
+        if RESUMEN_SHEET not in existing:
+            self._create_resumen_sheet()
 
-        # Re-formatear hojas mensuales existentes
-        for title, ws in existing.items():
-            if title in (TODAS_SHEET, RESUMEN_SHEET):
-                continue
-            if len(title) == 7 and title[4] == "-" and title[:4].isdigit():
-                self._format_transactions_sheet(ws)
+        # No re-formatear hojas mensuales existentes en cada arranque (ahorra cuota API)
 
         # Limpiar hoja por defecto si quedó vacía
         for default_name in ("Sheet1", "Hoja 1", "Hoja1"):
