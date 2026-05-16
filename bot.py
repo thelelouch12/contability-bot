@@ -181,4 +181,20 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    import time
+    import traceback
+
+    try:
+        main()
+    except Exception:
+        # Mantener el container vivo 5min al crashear para poder leer logs
+        print("=" * 60, flush=True)
+        print("FATAL ERROR — bot.py crasheó en startup:", flush=True)
+        traceback.print_exc()
+        print("=" * 60, flush=True)
+        print("Sleeping 5min antes de exit para que se puedan leer los logs...", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        time.sleep(300)
+        sys.exit(1)
