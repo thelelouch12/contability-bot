@@ -13,9 +13,19 @@ def _required(name: str) -> str:
 
 
 def _resolve_service_account_file() -> str:
-    """Si GOOGLE_SERVICE_ACCOUNT_JSON está seteada (deploy en cloud), escribirla a un archivo
-    temporal y devolver la ruta. Sino usar GOOGLE_SERVICE_ACCOUNT_FILE como antes (dev local)."""
-    json_blob = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    """Prioridad de fuentes de la SA:
+       1. GOOGLE_SERVICE_ACCOUNT_JSON_B64  (recomendado para Coolify/cloud — a prueba de escapes)
+       2. GOOGLE_SERVICE_ACCOUNT_JSON      (JSON crudo; frágil si pasa por shells/yaml)
+       3. GOOGLE_SERVICE_ACCOUNT_FILE      (ruta a archivo, para dev local)
+    Las opciones 1 y 2 escriben el JSON a /tmp/sa.json y devuelven esa ruta.
+    """
+    json_blob = None
+    b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+    if b64:
+        import base64
+        json_blob = base64.b64decode(b64).decode("utf-8")
+    else:
+        json_blob = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if json_blob:
         path = "/tmp/sa.json"
         with open(path, "w") as f:
