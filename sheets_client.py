@@ -97,33 +97,14 @@ class SheetsClient:
     def _format_transactions_sheet(self, ws: gspread.Worksheet) -> None:
         """Aplica todo el formato de una hoja de transacciones en 1 batch_update."""
         gid = ws.id
-        sp = self._sep  # ',' en en_US, ';' en es/fr/de/it/pt/nl
-        # Regla condicional: pintar fila amarilla si el código se repite (duplicado)
-        dup_rule = {
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": [{
-                        "sheetId": gid,
-                        "startRowIndex": 1,
-                        "endRowIndex": 1000,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": len(HEADERS),
-                    }],
-                    "booleanRule": {
-                        "condition": {
-                            "type": "CUSTOM_FORMULA",
-                            "values": [{"userEnteredValue": f'=AND($F2<>""{sp}$F2<>"N/A"{sp}COUNTIF($F:$F{sp}$F2)>1)'}],
-                        },
-                        "format": {
-                            "backgroundColor": {"red": 1.0, "green": 0.92, "blue": 0.6},
-                        },
-                    },
-                },
-                "index": 0,
-            }
-        }
+        # Reglas condicionales: colorear celda Estado (col E = idx 4) según valor
+        state_rules = [
+            self._state_color_rule(gid, "Exitosa", {"red": 0.72, "green": 0.88, "blue": 0.72}),    # verde
+            self._state_color_rule(gid, "Pendiente", {"red": 1.0, "green": 0.92, "blue": 0.6}),    # amarillo
+            self._state_color_rule(gid, "Fallida", {"red": 0.96, "green": 0.78, "blue": 0.78}),    # rojo
+        ]
         requests = [
-            dup_rule,
+            *state_rules,
             # Freeze header
             {
                 "updateSheetProperties": {
@@ -155,6 +136,26 @@ class SheetsClient:
             ],
         ]
         self._sh.batch_update({"requests": requests})
+
+    @staticmethod
+    def _state_color_rule(sheet_gid: int, value: str, color: dict) -> dict:
+        """Regla condicional: pinta celda E si su texto == value."""
+        return {
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_gid,
+                        "startRowIndex": 1, "endRowIndex": 1000,
+                        "startColumnIndex": 4, "endColumnIndex": 5,
+                    }],
+                    "booleanRule": {
+                        "condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": value}]},
+                        "format": {"backgroundColor": color, "textFormat": {"bold": True}},
+                    },
+                },
+                "index": 0,
+            }
+        }
 
     @staticmethod
     def _repeat_cell(gid, r0, r1, c0, c1, format_obj, fields):
@@ -317,6 +318,31 @@ class SheetsClient:
         resp_m = monthly.append_row(row, value_input_option="USER_ENTERED", include_values_in_response=True)
         self._add_checkbox_for_appended(monthly.id, resp_m)
         logger.info("Fila escrita en '%s' y '%s'", TODAS_SHEET, monthly.title)
+
+        # Si hay duplicados de código, escribir cross-reference en Notas OCR
+        if tx.codigo_transaccion and tx.codigo_transaccion != "N/A":
+            self._update_duplicate_notes(todas, tx.codigo_transaccion)
+            self._update_duplicate_notes(monthly, tx.codigo_transaccion)
+
+    def _update_duplicate_notes(self, ws: gspread.Worksheet, codigo: str) -> None:
+        """Si hay 2+ filas con el mismo código, escribe en cada una la lista de las otras."""
+        all_rows = ws.get_all_values()
+        # Encontrar filas (1-indexed) con ese código en col F (idx 5)
+        matches = [
+            i for i, r in enumerate(all_rows, 1)
+            if i > 1 and len(r) > 5 and r[5] == codigo
+        ]
+        if len(matches) < 2:
+            return
+
+        updates = []
+        for row_num in matches:
+            others = [str(r) for r in matches if r != row_num]
+            note = f"Duplicado con fila(s): {', '.join(others)}"
+            updates.append({"range": f"N{row_num}", "values": [[note]]})
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+        logger.info("Actualizadas notas de duplicados en '%s' para código %s (filas %s)",
+                    ws.title, codigo, matches)
 
     def _add_checkbox_for_appended(self, sheet_gid: int, resp: dict) -> None:
         rng = resp.get("updates", {}).get("updatedRange", "")
