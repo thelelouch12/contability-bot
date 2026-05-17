@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from datetime import datetime
 
 import gspread
@@ -57,6 +58,12 @@ class SheetsClient:
         self._gc = gspread.authorize(creds)
         self._sh = self._gc.open_by_key(sheet_id)
         self._monthly_lock = threading.Lock()
+        # Serializa writes a Sheets para evitar race condition de "first empty row" en
+        # append_row bajo concurrencia (asyncio.gather con N workers vía to_thread).
+        # Con throttle de 1s mantenemos <60 tx/min ≈ 300 ops/min, dentro del cupo Sheets API.
+        self._write_lock = threading.Lock()
+        self._last_write_ts = 0.0
+        self._min_write_interval = 1.0
         locale = self._sh.fetch_sheet_metadata().get("properties", {}).get("locale", "en_US")
         non_us = locale.split("_")[0] in {"es", "fr", "de", "it", "pt", "nl"}
         self._sep = ";" if non_us else ","
@@ -379,6 +386,29 @@ class SheetsClient:
     # ------------------------------- append -------------------------------
 
     def append_transaction(
+        self,
+        tx: Transaccion,
+        *,
+        message_id: int,
+        sender: str,
+        when: datetime,
+        image_link: str,
+    ) -> None:
+        # Lock + throttle: en lotes grandes (10–100 fotos paralelas) sin esto, dos
+        # append_row concurrentes pueden detectar la misma "primera fila vacía" y la
+        # segunda sobreescribe a la primera, perdiendo transacciones silenciosamente.
+        with self._write_lock:
+            elapsed = time.monotonic() - self._last_write_ts
+            if elapsed < self._min_write_interval:
+                time.sleep(self._min_write_interval - elapsed)
+            try:
+                self._do_append_transaction(
+                    tx, message_id=message_id, sender=sender, when=when, image_link=image_link,
+                )
+            finally:
+                self._last_write_ts = time.monotonic()
+
+    def _do_append_transaction(
         self,
         tx: Transaccion,
         *,
