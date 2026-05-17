@@ -63,7 +63,9 @@ class SheetsClient:
         # Con throttle de 1s mantenemos <60 tx/min ≈ 300 ops/min, dentro del cupo Sheets API.
         self._write_lock = threading.Lock()
         self._last_write_ts = 0.0
-        self._min_write_interval = 1.0
+        # 1.5s da margen vs el cupo de 300 writes/min de Sheets API cuando hay
+        # batch_updates de duplicados pesados encima del append base.
+        self._min_write_interval = 1.5
         locale = self._sh.fetch_sheet_metadata().get("properties", {}).get("locale", "en_US")
         non_us = locale.split("_")[0] in {"es", "fr", "de", "it", "pt", "nl"}
         self._sep = ";" if non_us else ","
@@ -447,19 +449,44 @@ class SheetsClient:
         self._add_checkbox_for_appended(monthly.id, resp_m)
         logger.info("Fila escrita en '%s' y '%s'", TODAS_SHEET, monthly.title)
 
-        # Si hay duplicados de código, escribir cross-reference en Notas OCR
+        # Cross-reference de duplicados REALES (mismo código + destinatario + valor).
+        # Esto evita el spam de batch_updates por pseudo-códigos como "TS3177" (que el
+        # banco usa como genérico de "Pendiente" sobre muchas tx distintas).
+        # Try/except: si falla por quota, NO debe tumbar la transacción que ya se escribió.
         if tx.codigo_transaccion and tx.codigo_transaccion != "N/A":
-            self._update_duplicate_notes(todas, tx.codigo_transaccion)
-            self._update_duplicate_notes(monthly, tx.codigo_transaccion)
+            try:
+                self._update_duplicate_notes(
+                    todas, tx.codigo_transaccion, tx.destino_numero, tx.valor,
+                )
+                self._update_duplicate_notes(
+                    monthly, tx.codigo_transaccion, tx.destino_numero, tx.valor,
+                )
+            except Exception as e:
+                logger.warning("Skip cross-ref de duplicados por error: %s", e)
 
-    def _update_duplicate_notes(self, ws: gspread.Worksheet, codigo: str) -> None:
-        """Si hay 2+ filas con el mismo código, escribe en cada una la lista de las otras."""
+    def _update_duplicate_notes(
+        self, ws: gspread.Worksheet, codigo: str, destino_numero: str, valor: float,
+    ) -> None:
+        """Marca como duplicado solo si código+destinatario+valor coinciden (duplicado real)."""
         all_rows = ws.get_all_values()
-        # Encontrar filas (1-indexed) con ese código en col F (idx 5)
-        matches = [
-            i for i, r in enumerate(all_rows, 1)
-            if i > 1 and len(r) > 5 and r[5] == codigo
-        ]
+        # Cols: F=código(5), H=destino_numero(7), J=valor(9)
+        # Normalizamos destino_numero quitando el prefijo "'" que usamos para forzar texto.
+        norm_dest = (destino_numero or "").lstrip("'")
+        valor_str = str(int(valor)) if valor == int(valor) else str(valor)
+        matches = []
+        for i, r in enumerate(all_rows, 1):
+            if i == 1 or len(r) < 10:
+                continue
+            if r[5] != codigo:
+                continue
+            r_dest = (r[7] or "").lstrip("'")
+            if r_dest != norm_dest:
+                continue
+            # valor en sheet viene formateado como "$ 1.234.567" o similar; comparamos por digitos
+            r_valor_digits = "".join(c for c in r[9] if c.isdigit())
+            if r_valor_digits != valor_str.replace(".", "").replace(",", ""):
+                continue
+            matches.append(i)
         if len(matches) < 2:
             return
 
@@ -469,8 +496,8 @@ class SheetsClient:
             note = f"Duplicado con fila(s): {', '.join(others)}"
             updates.append({"range": f"N{row_num}", "values": [[note]]})
         ws.batch_update(updates, value_input_option="USER_ENTERED")
-        logger.info("Actualizadas notas de duplicados en '%s' para código %s (filas %s)",
-                    ws.title, codigo, matches)
+        logger.info("Cross-ref de duplicados en '%s' codigo=%s destino=%s valor=%s filas=%s",
+                    ws.title, codigo, norm_dest, valor_str, matches)
 
     def _add_checkbox_for_appended(self, sheet_gid: int, resp: dict) -> None:
         rng = resp.get("updates", {}).get("updatedRange", "")
