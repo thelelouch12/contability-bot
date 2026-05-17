@@ -47,13 +47,15 @@ class _RateLimiter:
 EXTRACTION_PROMPT = """Eres un asistente contable. Analiza la imagen y extrae los datos en JSON estricto siguiendo el esquema.
 
 PASO 1 — Determina `es_comprobante`:
-- True SOLO si la imagen es un comprobante/recibo/notificación de una **transferencia o pago bancario efectivamente realizado** (con valor monetario que sale de una cuenta).
-- False en TODOS estos casos:
-  • Pantalla de saldo / consulta de cuenta (aunque muestre un monto, es solo el saldo).
+- True si la imagen es un comprobante/recibo/notificación bancaria de una **transferencia o pago** entre cuentas. INCLUYE transferencias EXITOSAS, PENDIENTES y **FALLIDAS** — siempre que tenga datos de la transacción (código/referencia, destinatario, monto). Una transferencia fallida con código y destinatario SÍ es comprobante (con estado=Fallida).
+- False SOLO en estos casos:
+  • Pantalla de saldo / consulta de cuenta (muestra saldo, no una transferencia específica).
   • Alerta de seguridad, login, token, OTP, mensaje de "clave casi lista".
-  • Pantalla de cajero automático con "Transacción No Exitosa" / "Fallida" / error.
-  • Captura random, meme, foto personal, screenshot de cualquier otra app.
+  • Mensaje de error genérico sin datos de transacción (sin código, sin destinatario, sin monto claro).
+  • Captura random, meme, foto personal, screenshot de cualquier otra app no bancaria.
   • Recibo de servicio público (luz, agua) sin transferencia bancaria.
+
+Regla clave: si hay código de transacción + destinatario + monto, es comprobante — sin importar si el estado es Exitosa, Pendiente o Fallida.
 
 PASO 2 — Si `es_comprobante=false`, devuelve: banco='N/A', estado='Desconocida', codigo='N/A', destino_*='N/A'/'Desconocido', valor=0, moneda='COP', notas_ocr=<motivo breve>.
 
