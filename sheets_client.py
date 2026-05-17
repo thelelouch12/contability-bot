@@ -23,8 +23,11 @@ HEADERS = [
     "ID Mensaje", "Fecha/Hora", "Remitente", "Banco", "Estado", "Código",
     "Destino - Nombre", "Destino - Número", "Destino - Tipo", "Valor",
     "Moneda", "Fecha Comprobante", "Imagen", "Notas OCR", "Verificado",
-    "Notas Manuales",
+    "Notas Manuales", "Comisionable",
 ]
+# Índices clave (1-based para A1 notation): O=15 Verificado, P=16 Notas Manuales, Q=17 Comisionable
+COL_VERIFICADO_IDX = 14  # 0-based, col O
+COL_COMISIONABLE_IDX = 16  # 0-based, col Q
 
 # Colores
 NAVY = {"red": 0.20, "green": 0.32, "blue": 0.45}
@@ -49,7 +52,7 @@ SUBHEADER_FMT = {
     "textFormat": {"bold": True, "fontSize": 11},
     "horizontalAlignment": "CENTER",
 }
-COL_WIDTHS = [70, 130, 200, 140, 95, 95, 160, 170, 105, 115, 75, 130, 95, 180, 95, 200]
+COL_WIDTHS = [70, 130, 200, 140, 95, 95, 160, 170, 105, 115, 75, 130, 95, 180, 95, 200, 115]
 
 
 class SheetsClient:
@@ -85,12 +88,27 @@ class SheetsClient:
             self._format_transactions_sheet(existing[TODAS_SHEET])
         # No re-formatear si ya existe → ahorra cuota de Sheets API en restarts
 
+        # Migración: añadir columna Comisionable a Todas y monthlies si no existe.
+        # Se ejecuta solo una vez (es no-op cuando ya está presente).
+        self._migrate_add_comisionable_column(existing)
+
         # Crear Resumen solo si no existe (las fórmulas son estables).
         # Si quieres recrearlo, bórralo manualmente del Sheet y reinicia.
         if RESUMEN_SHEET not in existing:
             self._create_resumen_sheet()
 
-        if REPORTE_SHEET not in existing:
+        # Reporte: recrear si quedó desactualizado (le falta la sección de Comisionables).
+        if REPORTE_SHEET in existing:
+            reporte_ws = existing[REPORTE_SHEET]
+            try:
+                marker = reporte_ws.acell("A23").value
+            except Exception:
+                marker = None
+            if marker != "COMISIÓN SOBRE COMISIONABLES":
+                logger.info("Reporte desactualizado, recreando con seccion de Comisionables")
+                self._sh.del_worksheet(reporte_ws)
+                self._create_reporte_sheet()
+        else:
             self._create_reporte_sheet()
 
         # No re-formatear hojas mensuales existentes en cada arranque (ahorra cuota API)
@@ -106,6 +124,59 @@ class SheetsClient:
                     self._sh.del_worksheet(ws)
                 except Exception:
                     pass
+
+    def _migrate_add_comisionable_column(self, existing: dict) -> None:
+        """Agrega la columna Comisionable (Q) a Todas y monthly tabs si no existe.
+        Idempotente: si el header de Q ya dice 'Comisionable', no hace nada.
+        Aplica checkbox validation a las filas con datos (no en filas vacías para no
+        romper la deteccion de tabla de append_row).
+        """
+        target_col_letter = "Q"  # col 17 = índice 16 (después del cambio HEADERS)
+        for title, ws in existing.items():
+            if title in (RESUMEN_SHEET, REPORTE_SHEET):
+                continue
+            # Es transactions sheet (Todas o YYYY-MM) si su header A1 = "ID Mensaje"
+            try:
+                first_header = ws.acell("A1").value
+            except Exception:
+                continue
+            if first_header != "ID Mensaje":
+                continue
+            try:
+                current = ws.acell(f"{target_col_letter}1").value
+            except Exception:
+                current = None
+            if current == "Comisionable":
+                continue
+            logger.info("Migrando '%s': agregando columna Comisionable en %s", title, target_col_letter)
+            # Contar filas con datos (col A no vacía)
+            col_a = ws.col_values(1)
+            last_data_row = len(col_a)  # incluye header en fila 1
+            # 0) Asegurar que el sheet tenga al menos len(HEADERS)=17 columnas
+            current_cols = ws.col_count
+            if current_cols < len(HEADERS):
+                ws.add_cols(len(HEADERS) - current_cols)
+            requests = []
+            # 1) escribir header (USER_ENTERED)
+            ws.update(values=[["Comisionable"]], range_name=f"{target_col_letter}1",
+                      value_input_option="USER_ENTERED")
+            # 2) formato de header + validation + ancho col, en un solo batch_update
+            gid = ws.id
+            requests.append(self._repeat_cell(gid, 0, 1, COL_COMISIONABLE_IDX, COL_COMISIONABLE_IDX + 1,
+                                              HEADER_FMT, "userEnteredFormat"))
+            requests.append({"updateDimensionProperties": {
+                "range": {"sheetId": gid, "dimension": "COLUMNS",
+                          "startIndex": COL_COMISIONABLE_IDX, "endIndex": COL_COMISIONABLE_IDX + 1},
+                "properties": {"pixelSize": 115},
+                "fields": "pixelSize",
+            }})
+            if last_data_row >= 2:
+                requests.append({"setDataValidation": {
+                    "range": {"sheetId": gid, "startRowIndex": 1, "endRowIndex": last_data_row,
+                              "startColumnIndex": COL_COMISIONABLE_IDX, "endColumnIndex": COL_COMISIONABLE_IDX + 1},
+                    "rule": {"condition": {"type": "BOOLEAN"}, "strict": True, "showCustomUi": True},
+                }})
+            self._sh.batch_update({"requests": requests})
 
     def _format_transactions_sheet(self, ws: gspread.Worksheet) -> None:
         """Aplica todo el formato de una hoja de transacciones en 1 batch_update."""
@@ -276,7 +347,7 @@ class SheetsClient:
     # ------------------------------- hojas mensuales -------------------------------
 
     def _create_reporte_sheet(self) -> None:
-        ws = self._sh.add_worksheet(title=REPORTE_SHEET, rows=40, cols=8)
+        ws = self._sh.add_worksheet(title=REPORTE_SHEET, rows=50, cols=8)
         gid = ws.id
         T = TODAS_SHEET
 
@@ -289,6 +360,14 @@ class SheetsClient:
             return (f'=IFERROR(IF(OR($B$5="";$B$5="(Todos)");'
                     f'SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"{estado}");'
                     f'SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!E"&$B$3&":E"&$B$4);"{estado}";INDIRECT("{T}!C"&$B$3&":C"&$B$4);$B$5));0)')
+
+        # Comisionable: col Q (Q=Comisionable=TRUE) y col E="Exitosa". Filtro opcional por remitente.
+        count_comis = (f'=IFERROR(IF(OR($B$5="";$B$5="(Todos)");'
+                       f'COUNTIFS(INDIRECT("{T}!Q"&$B$3&":Q"&$B$4);TRUE;INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Exitosa");'
+                       f'COUNTIFS(INDIRECT("{T}!Q"&$B$3&":Q"&$B$4);TRUE;INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Exitosa";INDIRECT("{T}!C"&$B$3&":C"&$B$4);$B$5));0)')
+        sum_comis = (f'=IFERROR(IF(OR($B$5="";$B$5="(Todos)");'
+                     f'SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!Q"&$B$3&":Q"&$B$4);TRUE;INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Exitosa");'
+                     f'SUMIFS(INDIRECT("{T}!J"&$B$3&":J"&$B$4);INDIRECT("{T}!Q"&$B$3&":Q"&$B$4);TRUE;INDIRECT("{T}!E"&$B$3&":E"&$B$4);"Exitosa";INDIRECT("{T}!C"&$B$3&":C"&$B$4);$B$5));0)')
 
         ws.batch_update([
             {"range": "A1", "values": [["REPORTE PERSONALIZADO"]]},
@@ -308,6 +387,12 @@ class SheetsClient:
             {"range": "A19", "values": [["COMISIÓN A COBRAR"]]},
             {"range": "A20:B20", "values": [["Comisión %:", 0]]},
             {"range": "A21:B21", "values": [["Comisión a cobrar:", "=B15*B20/100"]]},
+            # Nueva sección: comisión SOLO sobre las marcadas como Comisionable (col Q)
+            {"range": "A23", "values": [["COMISIÓN SOBRE COMISIONABLES"]]},
+            {"range": "A24:B24", "values": [["Cantidad Comisionables:", count_comis]]},
+            {"range": "A25:B25", "values": [["Total Comisionables:", sum_comis]]},
+            {"range": "A26:B26", "values": [["Comisión %:", 0]]},
+            {"range": "A27:B27", "values": [["Comisión a cobrar:", "=B25*B26/100"]]},
             # Helper oculto para el dropdown de remitentes
             {"range": "F1", "values": [["(Todos)"]]},
             {"range": "F2", "values": [[f'=IFERROR(UNIQUE(FILTER({T}!C2:C;{T}!C2:C<>""));"")']]},
@@ -352,13 +437,25 @@ class SheetsClient:
             repeat(14, 15, 1, 2, {"numberFormat": CURRENCY, "textFormat": {"bold": True}}),
             repeat(15, 16, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
             repeat(16, 17, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
-            # Comisión
+            # Comisión (sobre Exitosas)
             repeat(19, 21, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
             repeat(19, 20, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": {"type": "NUMBER", "pattern": "0.##\"%\""}, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
             repeat(20, 21, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
+            # Sección Comisión sobre Comisionables (fila 23 = idx 22)
+            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 22, "endRowIndex": 23, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
+            repeat(22, 23, 0, 3, {"backgroundColor": LIGHT_BLUE, "textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}),
+            repeat(23, 27, 0, 1, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}),
+            # Cantidad Comisionables (B24): número entero
+            repeat(23, 24, 1, 2, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
+            # Total Comisionables (B25): moneda
+            repeat(24, 25, 1, 2, {"numberFormat": CURRENCY, "textFormat": {"bold": True}}),
+            # Comisión % (B26): input
+            repeat(25, 26, 1, 2, {"backgroundColor": INPUT_BG, "numberFormat": {"type": "NUMBER", "pattern": "0.##\"%\""}, "textFormat": {"bold": True}, "horizontalAlignment": "CENTER"}),
+            # Comisión a cobrar (B27): destacado verde
+            repeat(26, 27, 1, 2, {"backgroundColor": GREEN_BG, "numberFormat": CURRENCY, "textFormat": {"bold": True, "fontSize": 12}}),
             # Anchos cols A B C D
             *[{"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": i, "endIndex": i+1}, "properties": {"pixelSize": w}, "fields": "pixelSize"}}
-              for i, w in enumerate([220, 200, 160, 20])],
+              for i, w in enumerate([240, 200, 160, 20])],
             # Ocultar columna F (helper)
             {"updateDimensionProperties": {"range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": 5, "endIndex": 6}, "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}},
             # Dropdown en B5
@@ -436,8 +533,9 @@ class SheetsClient:
             tx.fecha_comprobante or "",
             image_link,
             tx.notas_ocr or "",
-            False,
-            "",
+            False,  # Verificado
+            "",     # Notas Manuales
+            False,  # Comisionable
         ]
 
         todas = self._sh.worksheet(TODAS_SHEET)
@@ -505,15 +603,17 @@ class SheetsClient:
             return
         cell = rng.split("!")[1].split(":")[0]  # "A7"
         row_num = int("".join(c for c in cell if c.isdigit()))
-        self._sh.batch_update({"requests": [{
-            "setDataValidation": {
-                "range": {
-                    "sheetId": sheet_gid,
-                    "startRowIndex": row_num - 1,
-                    "endRowIndex": row_num,
-                    "startColumnIndex": 14,
-                    "endColumnIndex": 15,
-                },
-                "rule": {"condition": {"type": "BOOLEAN"}, "strict": True, "showCustomUi": True},
-            }
-        }]})
+        bool_rule = {"condition": {"type": "BOOLEAN"}, "strict": True, "showCustomUi": True}
+        # Validation para Verificado (col O = idx 14) y Comisionable (col Q = idx 16) en la fila recién appendeada
+        self._sh.batch_update({"requests": [
+            {"setDataValidation": {
+                "range": {"sheetId": sheet_gid, "startRowIndex": row_num - 1, "endRowIndex": row_num,
+                          "startColumnIndex": COL_VERIFICADO_IDX, "endColumnIndex": COL_VERIFICADO_IDX + 1},
+                "rule": bool_rule,
+            }},
+            {"setDataValidation": {
+                "range": {"sheetId": sheet_gid, "startRowIndex": row_num - 1, "endRowIndex": row_num,
+                          "startColumnIndex": COL_COMISIONABLE_IDX, "endColumnIndex": COL_COMISIONABLE_IDX + 1},
+                "rule": bool_rule,
+            }},
+        ]})
