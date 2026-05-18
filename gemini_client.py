@@ -11,7 +11,7 @@ from models import Transaccion
 logger = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 5
 MAX_BACKOFF_SEC = 65.0
 _RETRY_DELAY_RE = re.compile(r"retry in (\d+(?:\.\d+)?)s", re.IGNORECASE)
 

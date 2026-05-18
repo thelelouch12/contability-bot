@@ -21,8 +21,9 @@ logger = logging.getLogger("contability-bot")
 
 BATCH_DEBOUNCE_SEC = 2.0
 # Timeout per-foto. Si una foto se cuelga (ej. Gemini en retry infinito), no debe
-# bloquear el reply del batch entero. Generoso: 60s permite 3 reintentos de Gemini.
-PER_PHOTO_TIMEOUT_SEC = 60.0
+# bloquear el reply del batch entero. Acomoda los 5 reintentos de Gemini (backoff
+# exponencial acumulado ~31s + tiempo de cada call).
+PER_PHOTO_TIMEOUT_SEC = 90.0
 
 # Magic bytes de formatos de imagen aceptados. Defensa contra polyglot/MIME spoof:
 # si los primeros bytes no coinciden con un formato real, rechazamos antes de pasarlo a Gemini.
