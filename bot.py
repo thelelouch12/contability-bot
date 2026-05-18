@@ -20,6 +20,9 @@ logging.basicConfig(
 logger = logging.getLogger("contability-bot")
 
 BATCH_DEBOUNCE_SEC = 2.0
+# Timeout per-foto. Si una foto se cuelga (ej. Gemini en retry infinito), no debe
+# bloquear el reply del batch entero. Generoso: 60s permite 3 reintentos de Gemini.
+PER_PHOTO_TIMEOUT_SEC = 60.0
 
 # Magic bytes de formatos de imagen aceptados. Defensa contra polyglot/MIME spoof:
 # si los primeros bytes no coinciden con un formato real, rechazamos antes de pasarlo a Gemini.
@@ -222,10 +225,15 @@ class BotApp:
         await self._process_batch(messages)
 
     async def _process_batch(self, messages: list[Message]) -> None:
-        results = await asyncio.gather(
-            *[self._process_one(m) for m in messages],
-            return_exceptions=True,
-        )
+        # Cada foto con su propio timeout — una colgada NO debe bloquear el reply del batch.
+        async def run_one(m: Message):
+            try:
+                return await asyncio.wait_for(self._process_one(m), timeout=PER_PHOTO_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                logger.error("Timeout (%.0fs) procesando msg=%s — abortada",
+                             PER_PHOTO_TIMEOUT_SEC, m.message_id)
+                raise
+        results = await asyncio.gather(*[run_one(m) for m in messages], return_exceptions=True)
         ok = sum(1 for r in results if not isinstance(r, Exception))
         ignored = sum(1 for r in results if isinstance(r, (NotAComprobante, PhotoRejected)))
         err = len(results) - ok - ignored
