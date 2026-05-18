@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+from collections import deque
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,9 +21,31 @@ logger = logging.getLogger("contability-bot")
 
 BATCH_DEBOUNCE_SEC = 2.0
 
+# Magic bytes de formatos de imagen aceptados. Defensa contra polyglot/MIME spoof:
+# si los primeros bytes no coinciden con un formato real, rechazamos antes de pasarlo a Gemini.
+_IMAGE_MAGIC = (
+    b"\xff\xd8\xff",                  # JPEG
+    b"\x89PNG\r\n\x1a\n",             # PNG
+    b"GIF87a", b"GIF89a",             # GIF (raro en comprobantes pero válido)
+    b"BM",                            # BMP
+)
+
+
+def _looks_like_image(data: bytes) -> bool:
+    if len(data) < 12:
+        return False
+    if data.startswith(_IMAGE_MAGIC):
+        return True
+    # WebP usa contenedor RIFF: "RIFF....WEBP". Validar el subtipo descarta WAV/AVI.
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
 
 class NotAComprobante(Exception):
     """La imagen no es un comprobante de transferencia. Se ignora."""
+
+
+class PhotoRejected(Exception):
+    """Foto rechazada por validación de seguridad. Se ignora silenciosamente."""
 
 
 class BotApp:
@@ -33,11 +57,29 @@ class BotApp:
         self._pending: dict[str, list[Message]] = {}
         self._pending_tasks: dict[str, asyncio.Task] = {}
         self._pending_lock = asyncio.Lock()
+        # Rate limit: sliding window 60s por user_id
+        self._user_hits: dict[int, deque[float]] = {}
 
     def _chat_allowed(self, chat_id: int) -> bool:
         if not self.settings.allowed_chat_ids:
             return True
         return chat_id in self.settings.allowed_chat_ids
+
+    def _user_allowed(self, user_id: int | None) -> bool:
+        if not self.settings.allowed_user_ids:
+            return True
+        return user_id is not None and user_id in self.settings.allowed_user_ids
+
+    def _rate_limit_ok(self, user_id: int) -> bool:
+        now = time.monotonic()
+        window = 60.0
+        hits = self._user_hits.setdefault(user_id, deque())
+        while hits and now - hits[0] > window:
+            hits.popleft()
+        if len(hits) >= self.settings.user_rate_per_min:
+            return False
+        hits.append(now)
+        return True
 
     @staticmethod
     def _telegram_image_ref(chat_id: int, message_id: int, file_id: str) -> str:
@@ -62,12 +104,37 @@ class BotApp:
     async def handle_photo(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
         chat = update.effective_chat
+        user = msg.from_user
 
         if not self._chat_allowed(chat.id):
             logger.warning("Chat no permitido: %s (%s)", chat.id, chat.title)
             return
+        if not self._user_allowed(user.id if user else None):
+            logger.warning("Usuario no permitido en grupo: user_id=%s name=%s chat=%s",
+                           user.id if user else None,
+                           user.full_name if user else None,
+                           chat.id)
+            return
         if not msg.photo:
             return
+        if not self._rate_limit_ok(user.id):
+            logger.warning("Rate limit excedido: user_id=%s (%d/min)",
+                           user.id, self.settings.user_rate_per_min)
+            return
+
+        # Validar tamaño y dimensiones desde metadata de Telegram (sin descargar todavía).
+        photo = msg.photo[-1]  # variante de mayor resolución
+        if photo.file_size and photo.file_size > self.settings.max_photo_bytes:
+            logger.warning("Foto demasiado grande: %d bytes (max=%d) user=%s",
+                           photo.file_size, self.settings.max_photo_bytes, user.id)
+            return
+        if photo.width and photo.height:
+            pixels = photo.width * photo.height
+            if pixels > self.settings.max_photo_pixels:
+                logger.warning("Foto con demasiados pixeles: %dx%d=%d (max=%d) user=%s",
+                               photo.width, photo.height, pixels,
+                               self.settings.max_photo_pixels, user.id)
+                return
 
         group_key = msg.media_group_id or f"solo:{msg.message_id}"
         async with self._pending_lock:
@@ -97,11 +164,14 @@ class BotApp:
             return_exceptions=True,
         )
         ok = sum(1 for r in results if not isinstance(r, Exception))
-        ignored = sum(1 for r in results if isinstance(r, NotAComprobante))
+        ignored = sum(1 for r in results if isinstance(r, (NotAComprobante, PhotoRejected)))
         err = len(results) - ok - ignored
 
         if err:
-            first_err = next(r for r in results if isinstance(r, Exception) and not isinstance(r, NotAComprobante))
+            first_err = next(
+                r for r in results
+                if isinstance(r, Exception) and not isinstance(r, (NotAComprobante, PhotoRejected))
+            )
             logger.error("Errores en batch (%d/%d): %s", err, len(results), first_err)
 
         reply = self._summary_reply(ok, ignored, err, results)
@@ -112,6 +182,18 @@ class BotApp:
         photo = msg.photo[-1]
         tg_file = await photo.get_file()
         image_bytes = bytes(await tg_file.download_as_bytearray())
+
+        # Defensa: validar segundo bound de tamaño después de descargar.
+        if len(image_bytes) > self.settings.max_photo_bytes:
+            logger.warning("Foto descargada excede límite: %d bytes (max=%d) msg=%s",
+                           len(image_bytes), self.settings.max_photo_bytes, msg.message_id)
+            raise PhotoRejected("imagen muy grande")
+        # Defensa: rechazar si los magic bytes no son de un formato de imagen aceptado.
+        if not _looks_like_image(image_bytes):
+            logger.warning("Bytes no parecen una imagen válida (head=%s) msg=%s user=%s",
+                           image_bytes[:16].hex(), msg.message_id,
+                           msg.from_user.id if msg.from_user else None)
+            raise PhotoRejected("formato no reconocido")
 
         tx = await self.gemini.extract(image_bytes)
         logger.info("Gemini extrajo: %s", tx.model_dump())
@@ -146,7 +228,12 @@ class BotApp:
         if ignored:
             parts.append(f"⏭️ {ignored} ignorada{'s' if ignored != 1 else ''} (no comprobante)")
         if err:
-            first = next((r for r in results if isinstance(r, BaseException) and not isinstance(r, NotAComprobante)), None)
+            first = next(
+                (r for r in results
+                 if isinstance(r, BaseException)
+                 and not isinstance(r, (NotAComprobante, PhotoRejected))),
+                None,
+            )
             reason = BotApp._friendly_error(first) if first else "error"
             parts.append(f"❌ {err} con error: {reason}")
         # Si todo fue ignorado (típicamente 1 foto random en el grupo), mejor no responder nada para no hacer ruido

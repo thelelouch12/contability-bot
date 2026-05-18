@@ -19,6 +19,19 @@ TODAS_SHEET = "Todas"
 RESUMEN_SHEET = "Resumen"
 REPORTE_SHEET = "Reporte"
 
+# Caracteres que Sheets interpreta como inicio de fórmula. Si una celda string
+# proveniente del OCR (controlado por el atacante vía contenido de la imagen)
+# empieza con uno de estos, le prefijamos comilla simple para forzar texto literal.
+# Defensa estándar OWASP contra CSV/Formula Injection.
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell(value):
+    """Neutraliza formula injection en celdas string. Pasa-through para tipos no-string."""
+    if not isinstance(value, str) or not value:
+        return value
+    return "'" + value if value.startswith(_FORMULA_TRIGGERS) else value
+
 HEADERS = [
     "ID Mensaje", "Fecha/Hora", "Remitente", "Banco", "Estado", "Código",
     "Destino - Nombre", "Destino - Número", "Destino - Tipo", "Valor",
@@ -521,18 +534,18 @@ class SheetsClient:
         row = [
             str(message_id),
             when.strftime("%Y-%m-%d %H:%M:%S"),
-            sender,
-            tx.banco,
+            _safe_cell(sender),
+            _safe_cell(tx.banco),
             tx.estado.value,
-            tx.codigo_transaccion,
-            tx.destino_nombre,
-            destino_num,
+            _safe_cell(tx.codigo_transaccion),
+            _safe_cell(tx.destino_nombre),
+            destino_num,  # ya tiene prefijo '
             tx.destino_tipo.value,
             tx.valor,
             tx.moneda,
-            tx.fecha_comprobante or "",
+            _safe_cell(tx.fecha_comprobante or ""),
             image_link,
-            tx.notas_ocr or "",
+            _safe_cell(tx.notas_ocr or ""),
             False,  # Verificado
             "",     # Notas Manuales
             False,  # Comisionable
