@@ -68,7 +68,11 @@ PASO 3 — Si `es_comprobante=true`, extrae:
 - 'banco': banco/billetera emisora (Bancolombia, Nequi, Daviplata, BBVA, Davivienda, etc).
 - 'codigo_transaccion': referencia/comprobante/número de aprobación. 'N/A' si no aparece.
 - 'destino_*': info de la cuenta a la que se transfirió. Para Nequi/Daviplata usar ese enum en destino_tipo.
-- 'fecha_comprobante': ISO 8601 (YYYY-MM-DDTHH:MM:SS) si se puede; sino el texto tal cual.
+- 'fecha_comprobante': ISO 8601 (YYYY-MM-DDTHH:MM:SS) en **formato 24 horas SIEMPRE**. Reglas de conversión de hora obligatorias:
+  • Si la imagen muestra "p.m.", "pm", "PM" o "p. m." → SUMA 12 a la hora SI es menor que 12. Ejemplos: "6:30 p.m." → 18:30:00 | "12:15 p.m." → 12:15:00 (mediodía, NO suma) | "1:05 PM" → 13:05:00.
+  • Si la imagen muestra "a.m.", "am", "AM" o "a. m." → mantén la hora igual, EXCEPTO "12:XX a.m." que se convierte a "00:XX" (medianoche). Ejemplos: "8:45 a.m." → 08:45:00 | "12:30 a.m." → 00:30:00.
+  • Si NO hay indicador AM/PM y la hora es ambigua (1-11), revisa el contexto: si el banco muestra hora como "18:30" o "23:45" ya está en 24h, déjala así. Si no hay forma de saber, asume el formato que muestra el banco.
+  • NUNCA pongas "6:30" cuando el comprobante dice "6:30 p.m." — eso es ERROR. Debe ser "18:30:00".
 - Si un campo no es legible, usa 'N/A' o el enum 'Desconocido'/'Desconocida' que corresponda.
 """
 
