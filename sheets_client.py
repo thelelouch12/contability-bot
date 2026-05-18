@@ -105,9 +105,18 @@ class SheetsClient:
         # Se ejecuta solo una vez (es no-op cuando ya está presente).
         self._migrate_add_comisionable_column(existing)
 
-        # Crear Resumen solo si no existe (las fórmulas son estables).
-        # Si quieres recrearlo, bórralo manualmente del Sheet y reinicia.
-        if RESUMEN_SHEET not in existing:
+        # Resumen: recrear si quedó en versión vieja (marker en A3).
+        if RESUMEN_SHEET in existing:
+            resumen_ws = existing[RESUMEN_SHEET]
+            try:
+                marker = resumen_ws.acell("A3").value
+            except Exception:
+                marker = None
+            if marker != "INDICADORES POR ESTADO":
+                logger.info("Resumen desactualizado, recreando con KPIs y Top destinatarios")
+                self._sh.del_worksheet(resumen_ws)
+                self._create_resumen_sheet()
+        else:
             self._create_resumen_sheet()
 
         # Reporte: recrear si quedó desactualizado (le falta la sección de Comisionables).
@@ -270,79 +279,208 @@ class SheetsClient:
     # ------------------------------- Resumen -------------------------------
 
     def _create_resumen_sheet(self) -> None:
-        ws = self._sh.add_worksheet(title=RESUMEN_SHEET, rows=200, cols=12)
+        """Resumen con fórmulas (todo referencia 'Todas'):
+        - Filas 3-6: KPIs por estado (Exitosa/Pendiente/Fallida/Comisionables)
+        - Filas 8-10: Totales globales (Total General, Tx, Promedio, % Éxito)
+        - Filas 12-49: Desglose Por Banco | Por Remitente | Por Estado (con TOTAL)
+        - Filas 51-68: Por Mes (con TOTAL)
+        - Filas 70-83: Top 10 Destinatarios
+        """
+        ws = self._sh.add_worksheet(title=RESUMEN_SHEET, rows=90, cols=12)
         gid = ws.id
         sep = self._sep
         T = TODAS_SHEET
 
-        # Valores + fórmulas → 1 batch_update con USER_ENTERED
+        # Helpers de fórmula por estado
+        def sum_estado(estado):
+            return f'=SUMIFS({T}!J:J{sep}{T}!E:E{sep}"{estado}")'
+        def count_estado(estado):
+            return f'=COUNTIFS({T}!E:E{sep}"{estado}")'
+
+        # QUERYs base — cada una termina con un row TOTAL.
+        # Por Banco: D=Banco, J=Valor
+        q_banco = (f'=IFERROR(QUERY({T}!D2:J{sep}'
+                   f'"select D, count(D), sum(J) where D is not null and D <> \'\' '
+                   f'group by D order by sum(J) desc '
+                   f'label count(D) \'\', sum(J) \'\'"{sep}0){sep}"")')
+        # Por Remitente: C=Remitente
+        q_remit = (f'=IFERROR(QUERY({T}!C2:J{sep}'
+                   f'"select C, count(C), sum(J) where C is not null and C <> \'\' '
+                   f'group by C order by sum(J) desc '
+                   f'label count(C) \'\', sum(J) \'\'"{sep}0){sep}"")')
+        # Por Estado: E
+        q_estado = (f'=IFERROR(QUERY({T}!E2:J{sep}'
+                    f'"select E, count(E), sum(J) where E is not null and E <> \'\' '
+                    f'group by E order by sum(J) desc '
+                    f'label count(E) \'\', sum(J) \'\'"{sep}0){sep}"")')
+        # Por Mes: TEXT(B,yyyy-mm), J
+        q_mes = (f'=IFERROR(QUERY({{ARRAYFORMULA(IF({T}!B2:B=""{sep}""{sep}'
+                 f'TEXT({T}!B2:B{sep}"yyyy-mm"))){self._arr_col_sep}{T}!J2:J}}{sep}'
+                 f'"select Col1, count(Col1), sum(Col2) where Col1 is not null and Col1 <> \'\' '
+                 f'group by Col1 order by Col1 desc '
+                 f'label count(Col1) \'\', sum(Col2) \'\'"{sep}0){sep}"")')
+        # Top 10 Destinatarios: G=destino_nombre, H=destino_numero, J=valor
+        q_top = (f'=IFERROR(QUERY({T}!G2:J{sep}'
+                 f'"select G, H, count(G), sum(J) where G is not null and G <> \'\' '
+                 f'group by G, H order by sum(J) desc limit 10 '
+                 f'label count(G) \'\', sum(J) \'\'"{sep}0){sep}"")')
+
         ws.batch_update(
             [
+                # Título
                 {"range": "A1", "values": [["RESUMEN CONTABLE"]]},
-                {"range": "A3:C4", "values": [
-                    ["Total General:", "", f"=SUM({T}!J2:J)"],
-                    ["Transacciones:", "", f"=COUNTA({T}!A2:A)"],
-                ]},
-                {"range": "A6", "values": [["Por Banco"]]},
-                {"range": "A7:C7", "values": [["Banco", "Cantidad", "Total"]]},
-                {"range": "A8", "values": [[
-                    f'=IFERROR(QUERY({T}!D2:J{sep}"select D, count(D), sum(J) where D is not null group by D order by sum(J) desc label count(D) \'\', sum(J) \'\'"{sep}0){sep}"")'
+
+                # KPIs POR ESTADO (fila 3 marker, filas 4-6 cards)
+                {"range": "A3", "values": [["INDICADORES POR ESTADO"]]},
+                {"range": "A4:K4", "values": [[
+                    "✓ Exitosas", "", "",
+                    "⏳ Pendientes", "", "",
+                    "✗ Fallidas", "", "",
+                    "★ Comisionables", "",
                 ]]},
-                {"range": "E6", "values": [["Por Remitente"]]},
-                {"range": "E7:G7", "values": [["Remitente", "Cantidad", "Total"]]},
-                {"range": "E8", "values": [[
-                    f'=IFERROR(QUERY({T}!C2:J{sep}"select C, count(C), sum(J) where C is not null group by C order by sum(J) desc label count(C) \'\', sum(J) \'\'"{sep}0){sep}"")'
+                {"range": "A5:K5", "values": [[
+                    sum_estado("Exitosa"), "", "",
+                    sum_estado("Pendiente"), "", "",
+                    sum_estado("Fallida"), "", "",
+                    f'=SUMIFS({T}!J:J{sep}{T}!Q:Q{sep}TRUE)', "",
                 ]]},
-                {"range": "I6", "values": [["Por Estado"]]},
-                {"range": "I7:K7", "values": [["Estado", "Cantidad", "Total"]]},
-                {"range": "I8", "values": [[
-                    f'=IFERROR(QUERY({T}!E2:J{sep}"select E, count(E), sum(J) where E is not null group by E order by sum(J) desc label count(E) \'\', sum(J) \'\'"{sep}0){sep}"")'
+                {"range": "A6:K6", "values": [[
+                    count_estado("Exitosa"), "", "",
+                    count_estado("Pendiente"), "", "",
+                    count_estado("Fallida"), "", "",
+                    f'=COUNTIFS({T}!Q:Q{sep}TRUE)', "",
                 ]]},
-                {"range": "A50", "values": [["Por Mes"]]},
-                {"range": "A51:C51", "values": [["Mes", "Cantidad", "Total"]]},
-                {"range": "A52", "values": [[
-                    f'=IFERROR(QUERY({{ARRAYFORMULA(IF({T}!B2:B=""{sep}""{sep}TEXT({T}!B2:B{sep}"yyyy-mm"))){self._arr_col_sep}{T}!J2:J}}{sep}"select Col1, count(Col1), sum(Col2) where Col1 is not null and Col1 <> \'\' group by Col1 order by Col1 desc label count(Col1) \'\', sum(Col2) \'\'"{sep}0){sep}"")'
+
+                # TOTALES GLOBALES (filas 8-10)
+                {"range": "A8", "values": [["TOTALES GLOBALES"]]},
+                {"range": "A9:K9", "values": [[
+                    "Total General", "", "",
+                    "Transacciones", "", "",
+                    "Promedio", "", "",
+                    "% Éxito", "",
                 ]]},
+                {"range": "A10:K10", "values": [[
+                    f'=SUM({T}!J2:J)', "", "",
+                    f'=COUNTA({T}!A2:A)', "", "",
+                    f'=IFERROR(SUM({T}!J2:J)/COUNTA({T}!A2:A){sep}0)', "", "",
+                    f'=IFERROR(COUNTIFS({T}!E:E{sep}"Exitosa")/COUNTA({T}!A2:A){sep}0)', "",
+                ]]},
+
+                # DESGLOSE (filas 12+)
+                {"range": "A12", "values": [["Por Banco"]]},
+                {"range": "A13:C13", "values": [["Banco", "Cantidad", "Total"]]},
+                {"range": "A14", "values": [[q_banco]]},
+
+                {"range": "E12", "values": [["Por Remitente"]]},
+                {"range": "E13:G13", "values": [["Remitente", "Cantidad", "Total"]]},
+                {"range": "E14", "values": [[q_remit]]},
+
+                {"range": "I12", "values": [["Por Estado"]]},
+                {"range": "I13:K13", "values": [["Estado", "Cantidad", "Total"]]},
+                {"range": "I14", "values": [[q_estado]]},
+
+                # POR MES (fila 51)
+                {"range": "A51", "values": [["Por Mes"]]},
+                {"range": "A52:C52", "values": [["Mes", "Cantidad", "Total"]]},
+                {"range": "A53", "values": [[q_mes]]},
+
+                # TOP 10 DESTINATARIOS (fila 70)
+                {"range": "A70", "values": [["Top 10 Destinatarios"]]},
+                {"range": "A71:D71", "values": [["Destinatario", "Número", "Cantidad", "Total"]]},
+                {"range": "A72", "values": [[q_top]]},
             ],
             value_input_option="USER_ENTERED",
         )
 
-        # Formato + merges + anchos + freeze → 1 batch_update
+        # ─────────── Formato ───────────
+        currency_bold_large = {**CURRENCY_FMT, "textFormat": {"bold": True, "fontSize": 12, "foregroundColor": NAVY}}
+        count_bold = {"textFormat": {"bold": True, "fontSize": 11}, "horizontalAlignment": "CENTER"}
+        pct_fmt = {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"},
+                   "textFormat": {"bold": True, "fontSize": 12, "foregroundColor": NAVY},
+                   "horizontalAlignment": "CENTER"}
+        kpi_label = {"textFormat": {"bold": True, "fontSize": 10}, "horizontalAlignment": "CENTER",
+                     "backgroundColor": LIGHT_BLUE}
+        SECTION_HDR = {
+            "backgroundColor": NAVY,
+            "textFormat": {"foregroundColor": WHITE, "bold": True, "fontSize": 12},
+            "horizontalAlignment": "CENTER",
+            "verticalAlignment": "MIDDLE",
+        }
+
+        def merge(r0, r1, c0, c1):
+            return {"mergeCells": {
+                "range": {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1,
+                          "startColumnIndex": c0, "endColumnIndex": c1},
+                "mergeType": "MERGE_ALL",
+            }}
+
         requests = [
+            # Freeze top 2 rows (título)
             {"updateSheetProperties": {
-                "properties": {"sheetId": gid, "gridProperties": {"frozenRowCount": 4}},
+                "properties": {"sheetId": gid, "gridProperties": {"frozenRowCount": 2}},
                 "fields": "gridProperties.frozenRowCount",
             }},
-            # Título A1:L1 merge + format
-            {"mergeCells": {
-                "range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 12},
-                "mergeType": "MERGE_ALL",
-            }},
-            self._repeat_cell(gid, 0, 1, 0, 12, TITLE_FMT, "userEnteredFormat"),
-            # Total general label
-            self._repeat_cell(gid, 2, 4, 0, 2, {"textFormat": {"bold": True}, "horizontalAlignment": "RIGHT"}, "userEnteredFormat"),
-            self._repeat_cell(gid, 2, 3, 2, 3, {**CURRENCY_FMT, "textFormat": {"bold": True, "fontSize": 12}}, "userEnteredFormat"),
-            # Subheaders por sección
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 5, "endRowIndex": 6, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
-            self._repeat_cell(gid, 5, 6, 0, 3, SUBHEADER_FMT, "userEnteredFormat"),
-            self._repeat_cell(gid, 6, 7, 0, 3, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
-            self._repeat_cell(gid, 7, None, 2, 3, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
 
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 5, "endRowIndex": 6, "startColumnIndex": 4, "endColumnIndex": 7}, "mergeType": "MERGE_ALL"}},
-            self._repeat_cell(gid, 5, 6, 4, 7, SUBHEADER_FMT, "userEnteredFormat"),
-            self._repeat_cell(gid, 6, 7, 4, 7, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
-            self._repeat_cell(gid, 7, None, 6, 7, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+            # ── Título ──
+            merge(0, 1, 0, 11),
+            self._repeat_cell(gid, 0, 1, 0, 11, TITLE_FMT, "userEnteredFormat"),
 
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 5, "endRowIndex": 6, "startColumnIndex": 8, "endColumnIndex": 11}, "mergeType": "MERGE_ALL"}},
-            self._repeat_cell(gid, 5, 6, 8, 11, SUBHEADER_FMT, "userEnteredFormat"),
-            self._repeat_cell(gid, 6, 7, 8, 11, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
-            self._repeat_cell(gid, 7, None, 10, 11, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+            # ── KPIs POR ESTADO (filas 3-6, idx 2-5) ──
+            merge(2, 3, 0, 11),  # subheader "INDICADORES POR ESTADO"
+            self._repeat_cell(gid, 2, 3, 0, 11, SECTION_HDR, "userEnteredFormat"),
+            # 4 cards: cada card es 3 cols, la última es 2.
+            # Card 1: A4:B4 label, A5:B5 monto, A6:B6 cantidad
+            *[merge(r, r+1, c0, c1) for r in (3, 4, 5) for (c0, c1) in [(0,2),(3,5),(6,8),(9,11)]],
+            # Labels (fila 4) — 4 estilos por color
+            self._repeat_cell(gid, 3, 4, 0, 2, {**kpi_label, "backgroundColor": {"red":0.85,"green":0.95,"blue":0.85}}, "userEnteredFormat"),
+            self._repeat_cell(gid, 3, 4, 3, 5, {**kpi_label, "backgroundColor": {"red":1.0,"green":0.95,"blue":0.80}}, "userEnteredFormat"),
+            self._repeat_cell(gid, 3, 4, 6, 8, {**kpi_label, "backgroundColor": {"red":0.99,"green":0.85,"blue":0.85}}, "userEnteredFormat"),
+            self._repeat_cell(gid, 3, 4, 9, 11, {**kpi_label, "backgroundColor": {"red":0.90,"green":0.87,"blue":0.96}}, "userEnteredFormat"),
+            # Montos (fila 5) — currency grande
+            self._repeat_cell(gid, 4, 5, 0, 11, currency_bold_large, "userEnteredFormat"),
+            # Cantidades (fila 6) — número centrado
+            self._repeat_cell(gid, 5, 6, 0, 11, count_bold, "userEnteredFormat"),
 
-            # Por Mes (fila 50/51 → idx 49/50)
-            {"mergeCells": {"range": {"sheetId": gid, "startRowIndex": 49, "endRowIndex": 50, "startColumnIndex": 0, "endColumnIndex": 3}, "mergeType": "MERGE_ALL"}},
-            self._repeat_cell(gid, 49, 50, 0, 3, SUBHEADER_FMT, "userEnteredFormat"),
-            self._repeat_cell(gid, 50, 51, 0, 3, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
-            self._repeat_cell(gid, 51, None, 2, 3, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+            # ── TOTALES GLOBALES (filas 8-10, idx 7-9) ──
+            merge(7, 8, 0, 11),
+            self._repeat_cell(gid, 7, 8, 0, 11, SECTION_HDR, "userEnteredFormat"),
+            *[merge(r, r+1, c0, c1) for r in (8, 9) for (c0, c1) in [(0,2),(3,5),(6,8),(9,11)]],
+            self._repeat_cell(gid, 8, 9, 0, 11, kpi_label, "userEnteredFormat"),
+            # Total General y Promedio: currency
+            self._repeat_cell(gid, 9, 10, 0, 2, currency_bold_large, "userEnteredFormat"),
+            self._repeat_cell(gid, 9, 10, 6, 8, currency_bold_large, "userEnteredFormat"),
+            # Transacciones: número grande
+            self._repeat_cell(gid, 9, 10, 3, 5, {"textFormat": {"bold": True, "fontSize": 14, "foregroundColor": NAVY}, "horizontalAlignment": "CENTER"}, "userEnteredFormat"),
+            # % Éxito
+            self._repeat_cell(gid, 9, 10, 9, 11, pct_fmt, "userEnteredFormat"),
+
+            # ── DESGLOSE (fila 12 = idx 11) ──
+            merge(11, 12, 0, 3),
+            self._repeat_cell(gid, 11, 12, 0, 3, SUBHEADER_FMT, "userEnteredFormat"),
+            merge(11, 12, 4, 7),
+            self._repeat_cell(gid, 11, 12, 4, 7, SUBHEADER_FMT, "userEnteredFormat"),
+            merge(11, 12, 8, 11),
+            self._repeat_cell(gid, 11, 12, 8, 11, SUBHEADER_FMT, "userEnteredFormat"),
+            # Headers fila 13 (idx 12)
+            self._repeat_cell(gid, 12, 13, 0, 3, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
+            self._repeat_cell(gid, 12, 13, 4, 7, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
+            self._repeat_cell(gid, 12, 13, 8, 11, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
+            # Currency en col C (Total Banco), G (Total Remitente), K (Total Estado) desde fila 14
+            self._repeat_cell(gid, 13, 50, 2, 3, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+            self._repeat_cell(gid, 13, 50, 6, 7, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+            self._repeat_cell(gid, 13, 50, 10, 11, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+
+            # ── POR MES (fila 51 = idx 50) ──
+            merge(50, 51, 0, 3),
+            self._repeat_cell(gid, 50, 51, 0, 3, SUBHEADER_FMT, "userEnteredFormat"),
+            self._repeat_cell(gid, 51, 52, 0, 3, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
+            self._repeat_cell(gid, 52, 69, 2, 3, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
+
+            # ── TOP 10 DESTINATARIOS (fila 70 = idx 69) ──
+            merge(69, 70, 0, 4),
+            self._repeat_cell(gid, 69, 70, 0, 4, SUBHEADER_FMT, "userEnteredFormat"),
+            self._repeat_cell(gid, 70, 71, 0, 4, {"textFormat": {"bold": True}, "horizontalAlignment": "CENTER", "backgroundColor": LIGHT_BLUE}, "userEnteredFormat"),
+            self._repeat_cell(gid, 71, 82, 3, 4, CURRENCY_FMT, "userEnteredFormat.numberFormat"),
 
             # Anchos
             *[
@@ -353,9 +491,18 @@ class SheetsClient:
                 }}
                 for i, w in enumerate([160, 80, 130, 20, 200, 80, 130, 20, 130, 80, 130, 20])
             ],
+            # Altura mínima de filas KPI para que se vean cómodas
+            {"updateDimensionProperties": {
+                "range": {"sheetId": gid, "dimension": "ROWS", "startIndex": 3, "endIndex": 6},
+                "properties": {"pixelSize": 32}, "fields": "pixelSize",
+            }},
+            {"updateDimensionProperties": {
+                "range": {"sheetId": gid, "dimension": "ROWS", "startIndex": 8, "endIndex": 10},
+                "properties": {"pixelSize": 32}, "fields": "pixelSize",
+            }},
         ]
         self._sh.batch_update({"requests": requests})
-        logger.info("Hoja '%s' recreada con formato", RESUMEN_SHEET)
+        logger.info("Hoja '%s' recreada con formato (v2: KPIs + Top 10)", RESUMEN_SHEET)
 
     # ------------------------------- hojas mensuales -------------------------------
 
