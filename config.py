@@ -40,6 +40,7 @@ class Settings:
     telegram_bot_token: str
     allowed_chat_ids: set[int]
     allowed_user_ids: set[int]
+    admin_user_ids: set[int]
     gemini_api_key: str
     gemini_model: str
     gemini_rpm: int
@@ -50,6 +51,7 @@ class Settings:
     max_photo_bytes: int
     max_photo_pixels: int
     user_rate_per_min: int
+    bypass_ttl_min: int
 
 
 def load_settings() -> Settings:
@@ -57,11 +59,14 @@ def load_settings() -> Settings:
     allowed = {int(x) for x in raw_chats.split(",") if x.strip()} if raw_chats else set()
     raw_users = os.getenv("ALLOWED_USER_IDS", "").strip()
     allowed_users = {int(x) for x in raw_users.split(",") if x.strip()} if raw_users else set()
+    raw_admins = os.getenv("ADMIN_USER_IDS", "").strip()
+    admins = {int(x) for x in raw_admins.split(",") if x.strip()} if raw_admins else set()
 
     return Settings(
         telegram_bot_token=_required("TELEGRAM_BOT_TOKEN"),
         allowed_chat_ids=allowed,
         allowed_user_ids=allowed_users,
+        admin_user_ids=admins,
         gemini_api_key=_required("GEMINI_API_KEY"),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
         gemini_rpm=int(os.getenv("GEMINI_RPM", "14")),
@@ -72,6 +77,7 @@ def load_settings() -> Settings:
         max_photo_bytes=int(os.getenv("MAX_PHOTO_BYTES", str(5 * 1024 * 1024))),
         max_photo_pixels=int(os.getenv("MAX_PHOTO_PIXELS", str(50_000_000))),
         user_rate_per_min=int(os.getenv("USER_RATE_PER_MIN", "60")),
+        bypass_ttl_min=int(os.getenv("BYPASS_TTL_MIN", "30")),
     )
 
 

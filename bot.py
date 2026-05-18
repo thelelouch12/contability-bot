@@ -59,6 +59,9 @@ class BotApp:
         self._pending_lock = asyncio.Lock()
         # Rate limit: sliding window 60s por user_id
         self._user_hits: dict[int, deque[float]] = {}
+        # Bypass del clasificador es_comprobante. Vacío = inactivo.
+        # Valor = monotonic_ts cuando expira. Se setea con /bypass on (admin-only).
+        self._bypass_until: float = 0.0
 
     def _chat_allowed(self, chat_id: int) -> bool:
         if not self.settings.allowed_chat_ids:
@@ -81,6 +84,15 @@ class BotApp:
         hits.append(now)
         return True
 
+    def _is_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.settings.admin_user_ids
+
+    def _bypass_active(self) -> bool:
+        return time.monotonic() < self._bypass_until
+
+    def _bypass_seconds_left(self) -> int:
+        return max(0, int(self._bypass_until - time.monotonic()))
+
     @staticmethod
     def _telegram_image_ref(chat_id: int, message_id: int, file_id: str) -> str:
         if chat_id < -1_000_000_000_000:
@@ -100,6 +112,53 @@ class BotApp:
         await update.message.reply_text(
             "Hola! Envíame fotos de comprobantes y los registraré en el Excel."
         )
+
+    async def cmd_bypass(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Toggle del modo sin-clasificador (admin-only).
+        /bypass on  → activa por BYPASS_TTL_MIN minutos
+        /bypass off → desactiva
+        /bypass     → muestra estado
+        """
+        user = update.effective_user
+        if not self._is_admin(user.id if user else None):
+            logger.warning("Intento de /bypass por no-admin: user=%s", user.id if user else None)
+            return  # silencio total para no dar pistas
+
+        args = [a.lower() for a in (ctx.args or [])]
+        action = args[0] if args else "status"
+        ttl_min = self.settings.bypass_ttl_min
+
+        if action in ("on", "activar", "1", "true"):
+            self._bypass_until = time.monotonic() + ttl_min * 60
+            logger.warning("BYPASS activado por user=%s (%s) por %d min",
+                           user.id, user.full_name, ttl_min)
+            await update.message.reply_text(
+                f"⚠️ BYPASS ACTIVO por {ttl_min} min.\n"
+                f"Todas las fotos se registrarán SIN filtrar por es_comprobante.\n"
+                f"Se desactiva solo a las {ttl_min} min o con /bypass off."
+            )
+        elif action in ("off", "desactivar", "0", "false"):
+            was_active = self._bypass_active()
+            self._bypass_until = 0.0
+            logger.info("BYPASS desactivado por user=%s (estaba_activo=%s)",
+                        user.id, was_active)
+            await update.message.reply_text(
+                "✅ Bypass desactivado. Clasificador es_comprobante vuelve a estar activo."
+                if was_active else "Bypass ya estaba inactivo."
+            )
+        else:  # status
+            if self._bypass_active():
+                mins = self._bypass_seconds_left() // 60
+                secs = self._bypass_seconds_left() % 60
+                await update.message.reply_text(
+                    f"⚠️ Bypass ACTIVO. Expira en {mins}m {secs}s.\n"
+                    f"Uso: /bypass off para desactivar."
+                )
+            else:
+                await update.message.reply_text(
+                    f"Bypass INACTIVO (clasificador es_comprobante normal).\n"
+                    f"Uso: /bypass on para activar por {ttl_min} min."
+                )
 
     async def handle_photo(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         msg = update.effective_message
@@ -198,8 +257,12 @@ class BotApp:
         tx = await self.gemini.extract(image_bytes)
         logger.info("Gemini extrajo: %s", tx.model_dump())
 
-        # Skip si Gemini marca que no es un comprobante real (transferencia efectiva)
-        if not tx.es_comprobante or tx.valor == 0:
+        # BYPASS: si está activo (admin lo prendió con /bypass on), saltarse el
+        # filtro y forzar el registro de toda foto que Gemini haya podido extraer.
+        bypass = self._bypass_active()
+        if bypass:
+            logger.warning("BYPASS activo — registrando sin filtrar es_comprobante (msg=%s)", msg.message_id)
+        elif not tx.es_comprobante or tx.valor == 0:
             logger.info("Skip (no es comprobante): %s", tx.notas_ocr)
             raise NotAComprobante(tx.notas_ocr or "No parece un comprobante")
 
@@ -256,6 +319,7 @@ class BotApp:
         app = Application.builder().token(self.settings.telegram_bot_token).build()
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("id", self.cmd_id))
+        app.add_handler(CommandHandler("bypass", self.cmd_bypass))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         return app
 
