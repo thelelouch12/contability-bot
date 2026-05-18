@@ -59,9 +59,10 @@ class BotApp:
         self._pending_lock = asyncio.Lock()
         # Rate limit: sliding window 60s por user_id
         self._user_hits: dict[int, deque[float]] = {}
-        # Bypass del clasificador es_comprobante. Vacío = inactivo.
-        # Valor = monotonic_ts cuando expira. Se setea con /bypass on (admin-only).
-        self._bypass_until: float = 0.0
+        # Bypass del clasificador es_comprobante, SCOPED POR chat_id.
+        # Activado con /bypass on en un chat → afecta solo a ese chat.
+        # Si activás bypass en tu DM, NO afecta fotos del grupo (y viceversa).
+        self._bypass_until: dict[int, float] = {}
 
     def _chat_allowed(self, chat_id: int) -> bool:
         if not self.settings.allowed_chat_ids:
@@ -87,11 +88,11 @@ class BotApp:
     def _is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.settings.admin_user_ids
 
-    def _bypass_active(self) -> bool:
-        return time.monotonic() < self._bypass_until
+    def _bypass_active(self, chat_id: int) -> bool:
+        return time.monotonic() < self._bypass_until.get(chat_id, 0.0)
 
-    def _bypass_seconds_left(self) -> int:
-        return max(0, int(self._bypass_until - time.monotonic()))
+    def _bypass_seconds_left(self, chat_id: int) -> int:
+        return max(0, int(self._bypass_until.get(chat_id, 0.0) - time.monotonic()))
 
     @staticmethod
     def _telegram_image_ref(chat_id: int, message_id: int, file_id: str) -> str:
@@ -114,50 +115,53 @@ class BotApp:
         )
 
     async def cmd_bypass(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Toggle del modo sin-clasificador (admin-only).
-        /bypass on  → activa por BYPASS_TTL_MIN minutos
-        /bypass off → desactiva
-        /bypass     → muestra estado
+        """Toggle del modo sin-clasificador (admin-only). SCOPED al chat donde se invoca.
+        /bypass on  → activa por BYPASS_TTL_MIN minutos SOLO en este chat
+        /bypass off → desactiva en este chat
+        /bypass     → muestra estado de este chat
         """
         user = update.effective_user
+        chat = update.effective_chat
         if not self._is_admin(user.id if user else None):
-            logger.warning("Intento de /bypass por no-admin: user=%s", user.id if user else None)
+            logger.warning("Intento de /bypass por no-admin: user=%s chat=%s",
+                           user.id if user else None, chat.id)
             return  # silencio total para no dar pistas
 
         args = [a.lower() for a in (ctx.args or [])]
         action = args[0] if args else "status"
         ttl_min = self.settings.bypass_ttl_min
+        scope = "este DM" if chat.type == "private" else f"el grupo «{chat.title or chat.id}»"
 
         if action in ("on", "activar", "1", "true"):
-            self._bypass_until = time.monotonic() + ttl_min * 60
-            logger.warning("BYPASS activado por user=%s (%s) por %d min",
-                           user.id, user.full_name, ttl_min)
+            self._bypass_until[chat.id] = time.monotonic() + ttl_min * 60
+            logger.warning("BYPASS activado por user=%s en chat=%s (%s) por %d min",
+                           user.id, chat.id, chat.title or "DM", ttl_min)
             await update.message.reply_text(
-                f"⚠️ BYPASS ACTIVO por {ttl_min} min.\n"
-                f"Todas las fotos se registrarán SIN filtrar por es_comprobante.\n"
-                f"Se desactiva solo a las {ttl_min} min o con /bypass off."
+                f"⚠️ BYPASS ACTIVO en {scope} por {ttl_min} min.\n"
+                f"Las fotos enviadas AQUÍ se registrarán sin filtrar por es_comprobante.\n"
+                f"Otros chats NO se ven afectados.\n"
+                f"Se desactiva solo a los {ttl_min} min o con /bypass off."
             )
         elif action in ("off", "desactivar", "0", "false"):
-            was_active = self._bypass_active()
-            self._bypass_until = 0.0
-            logger.info("BYPASS desactivado por user=%s (estaba_activo=%s)",
-                        user.id, was_active)
+            was_active = self._bypass_active(chat.id)
+            self._bypass_until.pop(chat.id, None)
+            logger.info("BYPASS desactivado en chat=%s por user=%s (estaba_activo=%s)",
+                        chat.id, user.id, was_active)
             await update.message.reply_text(
-                "✅ Bypass desactivado. Clasificador es_comprobante vuelve a estar activo."
-                if was_active else "Bypass ya estaba inactivo."
+                f"✅ Bypass desactivado en {scope}. Clasificador vuelve a estar activo."
+                if was_active else f"Bypass ya estaba inactivo en {scope}."
             )
         else:  # status
-            if self._bypass_active():
-                mins = self._bypass_seconds_left() // 60
-                secs = self._bypass_seconds_left() % 60
+            if self._bypass_active(chat.id):
+                left = self._bypass_seconds_left(chat.id)
                 await update.message.reply_text(
-                    f"⚠️ Bypass ACTIVO. Expira en {mins}m {secs}s.\n"
+                    f"⚠️ Bypass ACTIVO en {scope}. Expira en {left//60}m {left%60}s.\n"
                     f"Uso: /bypass off para desactivar."
                 )
             else:
                 await update.message.reply_text(
-                    f"Bypass INACTIVO (clasificador es_comprobante normal).\n"
-                    f"Uso: /bypass on para activar por {ttl_min} min."
+                    f"Bypass INACTIVO en {scope} (clasificador normal).\n"
+                    f"Uso: /bypass on para activar por {ttl_min} min SOLO aquí."
                 )
 
     async def handle_photo(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -257,11 +261,12 @@ class BotApp:
         tx = await self.gemini.extract(image_bytes)
         logger.info("Gemini extrajo: %s", tx.model_dump())
 
-        # BYPASS: si está activo (admin lo prendió con /bypass on), saltarse el
-        # filtro y forzar el registro de toda foto que Gemini haya podido extraer.
-        bypass = self._bypass_active()
-        if bypass:
-            logger.warning("BYPASS activo — registrando sin filtrar es_comprobante (msg=%s)", msg.message_id)
+        # BYPASS: si está activo en ESTE chat (admin lo prendió con /bypass on aquí),
+        # saltarse el filtro y forzar el registro. Scope por chat_id evita que el
+        # bypass de un chat (DM) afecte fotos de otro chat (grupo).
+        if self._bypass_active(msg.chat.id):
+            logger.warning("BYPASS activo en chat=%s — registrando sin filtrar es_comprobante (msg=%s)",
+                           msg.chat.id, msg.message_id)
         elif not tx.es_comprobante or tx.valor == 0:
             logger.info("Skip (no es comprobante): %s", tx.notas_ocr)
             raise NotAComprobante(tx.notas_ocr or "No parece un comprobante")
