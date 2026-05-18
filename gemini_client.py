@@ -57,9 +57,14 @@ PASO 1 — Determina `es_comprobante`:
   • Captura random, meme, foto personal, screenshot de cualquier otra app no bancaria.
   • Recibo de servicio público (luz, agua) sin transferencia bancaria.
 
-Regla clave: si hay código de transacción + destinatario + monto, es comprobante (es_comprobante=true) — SIEMPRE, sin importar el estado. Mapea el estado así:
+Regla clave de aceptación: es comprobante (es_comprobante=true) si la imagen muestra una transacción bancaria con AL MENOS estos dos elementos:
+  (a) destinatario (nombre o número de cuenta visible), Y
+  (b) monto (valor numérico transferido).
+El código de transacción es OPCIONAL — si no aparece, usa codigo_transaccion="N/A" pero MANTÉN es_comprobante=true. NO descartes una transferencia por no tener código visible. Las transferencias "en proceso" / "pendientes" frecuentemente no muestran código aún — esas SÍ son comprobantes (con estado=Pendiente).
+
+Mapea el estado así:
   - "Exitosa", "Aprobada", "Confirmada", "Realizada", "Completada" → Exitosa
-  - "Pendiente", "En proceso", "Procesando", "Validando", "En validación", "En trámite" → Pendiente
+  - "Pendiente", "En proceso", "Procesando", "Validando", "En validación", "En trámite", "Transferencia en proceso" → Pendiente
   - "Fallida", "Rechazada", "No exitosa", "Error", "No procesada" → Fallida
   - Si NO se puede determinar el estado claramente, usa Pendiente (NO descartes la imagen).
 
