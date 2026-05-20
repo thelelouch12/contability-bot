@@ -696,22 +696,8 @@ class BotApp:
 
     @staticmethod
     def _closing_text(r: PendingReview, icon: str, action_line: str) -> str:
-        """Mensaje final cuando la review se cierra — preserva los datos para historial."""
-        tx = r.tx
-        h = html.escape
-        try:
-            valor_fmt = f"{tx.valor:,.0f}".replace(",", ".")
-        except Exception:
-            valor_fmt = str(tx.valor)
-        lines = [
-            f"{icon} <b>{h(action_line)}</b>  <code>#{r.review_id}</code>",
-            f"<i>De:</i> {h(r.sender_full_name)}",
-            f"<b>Banco:</b> {h(tx.banco)} · <b>Estado:</b> {h(tx.estado.value)}",
-            f"<b>Destino:</b> {h(tx.destino_nombre)} ({h(tx.destino_numero)})",
-            f"<b>Valor:</b> {valor_fmt} {h(tx.moneda)}",
-            f"<b>Código:</b> {h(tx.codigo_transaccion)}",
-        ]
-        return "\n".join(lines)
+        """Mensaje final cuando la review se cierra — solo línea de status + admin + ID."""
+        return f"{icon} <b>{html.escape(action_line)}</b>  <code>#{r.review_id}</code>"
 
     # ------------------------------- edición de campo (texto) -------------------------------
 
