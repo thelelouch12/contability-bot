@@ -52,6 +52,11 @@ class Settings:
     max_photo_pixels: int
     user_rate_per_min: int
     bypass_ttl_min: int
+    r2_account_id: str
+    r2_access_key_id: str
+    r2_secret_access_key: str
+    r2_bucket_name: str
+    r2_public_url: str
 
 
 def load_settings() -> Settings:
@@ -78,6 +83,11 @@ def load_settings() -> Settings:
         max_photo_pixels=int(os.getenv("MAX_PHOTO_PIXELS", str(50_000_000))),
         user_rate_per_min=int(os.getenv("USER_RATE_PER_MIN", "60")),
         bypass_ttl_min=int(os.getenv("BYPASS_TTL_MIN", "30")),
+        r2_account_id=os.getenv("R2_ACCOUNT_ID", "").strip(),
+        r2_access_key_id=os.getenv("R2_ACCESS_KEY_ID", "").strip(),
+        r2_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
+        r2_bucket_name=os.getenv("R2_BUCKET_NAME", "").strip(),
+        r2_public_url=os.getenv("R2_PUBLIC_URL", "").strip().rstrip("/"),
     )
 
 

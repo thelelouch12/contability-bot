@@ -27,6 +27,7 @@ from telegram.ext import (
 from config import load_settings
 from gemini_client import GeminiClient
 from models import EstadoTransaccion, TipoCuenta, Transaccion
+from r2_client import R2Client
 from sheets_client import SheetsClient
 
 logging.basicConfig(
@@ -95,6 +96,7 @@ class PendingReview:
 
     Vive en memoria (`BotApp._reviews`) — se pierde si el bot se reinicia.
     `tx` se muta vía botones/edición; al aceptar se escribe a Sheets.
+    Conservamos `image_bytes` para no re-descargar de Telegram al subir a R2.
     """
 
     review_id: str
@@ -107,6 +109,7 @@ class PendingReview:
     sender_user_id: int
     photo_date: datetime
     image_ref: str
+    image_bytes: bytes | None = None
     review_message_id: int | None = None
     awaiting_edit_field: str | None = None
     awaiting_edit_admin_id: int | None = None
@@ -119,6 +122,18 @@ class BotApp:
         self.tz = ZoneInfo(self.settings.timezone)
         self.gemini = GeminiClient(self.settings.gemini_api_key, self.settings.gemini_model, self.settings.gemini_rpm)
         self.sheets = SheetsClient(self.settings.service_account_file, self.settings.sheet_id)
+        # R2 opcional — si las creds no están, image_link queda como link de Telegram.
+        if R2Client.is_configured(self.settings):
+            self.r2: R2Client | None = R2Client(
+                self.settings.r2_account_id,
+                self.settings.r2_access_key_id,
+                self.settings.r2_secret_access_key,
+                self.settings.r2_bucket_name,
+                self.settings.r2_public_url,
+            )
+        else:
+            self.r2 = None
+            logger.info("R2 no configurado — usando link de Telegram como image_link")
         self._pending: dict[str, list[Message]] = {}
         self._pending_tasks: dict[str, asyncio.Task] = {}
         self._pending_lock = asyncio.Lock()
@@ -358,21 +373,44 @@ class BotApp:
             logger.warning("BYPASS activo en chat=%s — registrando sin revisión (msg=%s)",
                            msg.chat.id, msg.message_id)
             sender_display = f"{sender} (@{username})" if username else sender
+            link = await self._upload_or_fallback(image_bytes, when, tx,
+                                                  msg.message_id, image_ref)
             await asyncio.to_thread(
                 self.sheets.append_transaction,
                 tx,
                 message_id=msg.message_id,
                 sender=sender_display,
                 when=when,
-                image_link=image_ref,
+                image_link=link,
             )
             return "auto_written"
 
         # Flujo normal: crear tarjeta de revisión.
         await self._create_review_card(
-            msg, tx, sender, username, when, image_ref,
+            msg, tx, sender, username, when, image_ref, image_bytes,
         )
         return "review_created"
+
+    async def _upload_or_fallback(
+        self,
+        image_bytes: bytes | None,
+        when: datetime,
+        tx: Transaccion,
+        message_id: int,
+        fallback: str,
+    ) -> str:
+        """Sube a R2 si está configurado. Si falla o no está, devuelve `fallback`."""
+        if not self.r2 or not image_bytes:
+            return fallback
+        try:
+            return await asyncio.to_thread(
+                self.r2.upload_receipt, image_bytes, when, tx,
+                telegram_msg_id=message_id,
+            )
+        except Exception as e:
+            logger.error("R2 upload falló (msg=%s): %s — uso fallback %s",
+                         message_id, e, fallback)
+            return fallback
 
     async def _create_review_card(
         self,
@@ -382,6 +420,7 @@ class BotApp:
         sender_username: str | None,
         when: datetime,
         image_ref: str,
+        image_bytes: bytes,
     ) -> None:
         rid = uuid.uuid4().hex[:8]
         review = PendingReview(
@@ -395,6 +434,7 @@ class BotApp:
             sender_user_id=photo_msg.from_user.id if photo_msg.from_user else 0,
             photo_date=when,
             image_ref=image_ref,
+            image_bytes=image_bytes,
         )
         text, kb = self._render_card(review)
         sent = await photo_msg.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -578,6 +618,10 @@ class BotApp:
             f"{r.sender_full_name} (@{r.sender_username})"
             if r.sender_username else r.sender_full_name
         )
+        # Subir a R2 con los datos actuales (posiblemente editados) del tx.
+        link = await self._upload_or_fallback(
+            r.image_bytes, r.photo_date, r.tx, r.photo_message_id, r.image_ref,
+        )
         try:
             await asyncio.to_thread(
                 self.sheets.append_transaction,
@@ -585,7 +629,7 @@ class BotApp:
                 message_id=r.photo_message_id,
                 sender=sender_display,
                 when=r.photo_date,
-                image_link=r.image_ref,
+                image_link=link,
             )
         except Exception as e:
             logger.error("Error escribiendo a Sheets para review %s: %s", r.review_id, e)
