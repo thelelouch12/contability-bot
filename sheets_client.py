@@ -36,11 +36,12 @@ HEADERS = [
     "ID Mensaje", "Fecha/Hora", "Remitente", "Banco", "Estado", "Código",
     "Destino - Nombre", "Destino - Número", "Destino - Tipo", "Valor",
     "Moneda", "Fecha Comprobante", "Imagen", "Notas OCR", "Verificado",
-    "Notas Manuales", "Comisionable",
+    "Notas Manuales", "Comisionable", "Aprobado por",
 ]
-# Índices clave (1-based para A1 notation): O=15 Verificado, P=16 Notas Manuales, Q=17 Comisionable
+# Índices clave (1-based para A1 notation): O=15 Verificado, P=16 Notas Manuales, Q=17 Comisionable, R=18 Aprobado por
 COL_VERIFICADO_IDX = 14  # 0-based, col O
 COL_COMISIONABLE_IDX = 16  # 0-based, col Q
+COL_APROBADO_IDX = 17  # 0-based, col R
 
 # Colores
 NAVY = {"red": 0.20, "green": 0.32, "blue": 0.45}
@@ -65,7 +66,7 @@ SUBHEADER_FMT = {
     "textFormat": {"bold": True, "fontSize": 11},
     "horizontalAlignment": "CENTER",
 }
-COL_WIDTHS = [70, 130, 200, 140, 95, 95, 160, 170, 105, 115, 75, 130, 95, 180, 95, 200, 115]
+COL_WIDTHS = [70, 130, 200, 140, 95, 95, 160, 170, 105, 115, 75, 130, 95, 180, 95, 200, 115, 160]
 
 
 class SheetsClient:
@@ -104,6 +105,13 @@ class SheetsClient:
         # Migración: añadir columna Comisionable a Todas y monthlies si no existe.
         # Se ejecuta solo una vez (es no-op cuando ya está presente).
         self._migrate_add_comisionable_column(existing)
+
+        # Migración: añadir regla condicional para "Revisión" → púrpura en hojas
+        # transactions que ya existían antes de esta feature.
+        self._migrate_add_revision_color(existing)
+
+        # Migración: añadir columna "Aprobado por" (R) a Todas y monthlies si no existe.
+        self._migrate_add_aprobado_column(existing)
 
         # Resumen: recrear si quedó en versión vieja (marker en A3).
         if RESUMEN_SHEET in existing:
@@ -146,6 +154,81 @@ class SheetsClient:
                     self._sh.del_worksheet(ws)
                 except Exception:
                     pass
+
+    def _migrate_add_aprobado_column(self, existing: dict) -> None:
+        """Agrega la columna 'Aprobado por' (R) a transactions sheets si no existe.
+        Idempotente: si el header de R ya dice 'Aprobado por', no hace nada."""
+        import re as _re
+        _monthly_re = _re.compile(r"^\d{4}-\d{2}$")
+        target_col_letter = "R"
+        for title, ws in existing.items():
+            if title != TODAS_SHEET and not _monthly_re.match(title):
+                continue
+            try:
+                current = ws.acell(f"{target_col_letter}1").value
+            except Exception:
+                current = None
+            if current == "Aprobado por":
+                continue
+            logger.info("Migración: agregando columna 'Aprobado por' en '%s'", title)
+            # Asegurar que el sheet tenga >= len(HEADERS) columnas
+            if ws.col_count < len(HEADERS):
+                ws.add_cols(len(HEADERS) - ws.col_count)
+            ws.update(values=[["Aprobado por"]], range_name=f"{target_col_letter}1",
+                      value_input_option="USER_ENTERED")
+            gid = ws.id
+            self._sh.batch_update({"requests": [
+                self._repeat_cell(gid, 0, 1, COL_APROBADO_IDX, COL_APROBADO_IDX + 1,
+                                  HEADER_FMT, "userEnteredFormat"),
+                {"updateDimensionProperties": {
+                    "range": {"sheetId": gid, "dimension": "COLUMNS",
+                              "startIndex": COL_APROBADO_IDX, "endIndex": COL_APROBADO_IDX + 1},
+                    "properties": {"pixelSize": 160},
+                    "fields": "pixelSize",
+                }},
+            ]})
+
+    def _migrate_add_revision_color(self, existing: dict) -> None:
+        """Idempotente: agrega regla 'Revisión' → púrpura a cada hoja transactions
+        que no la tenga. Lee conditionalFormats del metadata del spreadsheet para
+        no duplicar la regla en restarts."""
+        try:
+            meta = self._sh.fetch_sheet_metadata()
+        except Exception as e:
+            logger.warning("No pude leer metadata para migrar color de Revisión: %s", e)
+            return
+
+        sheets_meta = {s["properties"]["sheetId"]: s for s in meta.get("sheets", [])}
+        requests = []
+        purple_color = {"red": 0.86, "green": 0.78, "blue": 0.96}
+
+        import re as _re
+        _monthly_re = _re.compile(r"^\d{4}-\d{2}$")
+        for title, ws in existing.items():
+            # Detectar hojas transactions: TODAS o YYYY-MM (no Resumen/Reporte/etc).
+            if title != TODAS_SHEET and not _monthly_re.match(title):
+                continue
+
+            sm = sheets_meta.get(ws.id, {})
+            rules = sm.get("conditionalFormats", [])
+            # Detectar si ya hay regla con TEXT_EQ value "Revisión"
+            has_revision = False
+            for rule in rules:
+                cond = (rule.get("booleanRule") or {}).get("condition") or {}
+                if cond.get("type") != "TEXT_EQ":
+                    continue
+                values = cond.get("values") or []
+                if any(v.get("userEnteredValue") == "Revisión" for v in values):
+                    has_revision = True
+                    break
+            if has_revision:
+                continue
+
+            logger.info("Migración: agregando regla de color púrpura 'Revisión' en '%s'", title)
+            requests.append(self._state_color_rule(ws.id, "Revisión", purple_color))
+
+        if requests:
+            self._sh.batch_update({"requests": requests})
 
     def _migrate_add_comisionable_column(self, existing: dict) -> None:
         """Agrega la columna Comisionable (Q) a Todas y monthly tabs si no existe.
@@ -208,6 +291,7 @@ class SheetsClient:
             self._state_color_rule(gid, "Exitosa", {"red": 0.72, "green": 0.88, "blue": 0.72}),    # verde
             self._state_color_rule(gid, "Pendiente", {"red": 1.0, "green": 0.92, "blue": 0.6}),    # amarillo
             self._state_color_rule(gid, "Fallida", {"red": 0.96, "green": 0.78, "blue": 0.78}),    # rojo
+            self._state_color_rule(gid, "Revisión", {"red": 0.86, "green": 0.78, "blue": 0.96}),   # púrpura/lavanda
         ]
         requests = [
             *state_rules,
@@ -652,6 +736,7 @@ class SheetsClient:
         sender: str,
         when: datetime,
         image_link: str,
+        approved_by: str = "",
     ) -> None:
         # Lock + throttle: en lotes grandes (10–100 fotos paralelas) sin esto, dos
         # append_row concurrentes pueden detectar la misma "primera fila vacía" y la
@@ -662,7 +747,8 @@ class SheetsClient:
                 time.sleep(self._min_write_interval - elapsed)
             try:
                 self._do_append_transaction(
-                    tx, message_id=message_id, sender=sender, when=when, image_link=image_link,
+                    tx, message_id=message_id, sender=sender, when=when,
+                    image_link=image_link, approved_by=approved_by,
                 )
             finally:
                 self._last_write_ts = time.monotonic()
@@ -675,6 +761,7 @@ class SheetsClient:
         sender: str,
         when: datetime,
         image_link: str,
+        approved_by: str,
     ) -> None:
         destino_num = f"'{tx.destino_numero}" if tx.destino_numero else ""
 
@@ -696,6 +783,7 @@ class SheetsClient:
             False,  # Verificado
             "",     # Notas Manuales
             False,  # Comisionable
+            _safe_cell(approved_by),  # Aprobado por
         ]
 
         todas = self._sh.worksheet(TODAS_SHEET)

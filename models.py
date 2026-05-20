@@ -7,6 +7,7 @@ class EstadoTransaccion(str, Enum):
     EXITOSA = "Exitosa"
     PENDIENTE = "Pendiente"
     FALLIDA = "Fallida"
+    REVISION = "Revisión"
     DESCONOCIDA = "Desconocida"
 
 

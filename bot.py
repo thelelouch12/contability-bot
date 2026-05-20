@@ -26,7 +26,7 @@ from telegram.ext import (
 
 from config import load_settings
 from gemini_client import GeminiClient
-from models import EstadoTransaccion, TipoCuenta, Transaccion
+from models import EstadoTransaccion, Transaccion
 from r2_client import R2Client
 from sheets_client import SheetsClient
 
@@ -51,28 +51,6 @@ _IMAGE_MAGIC = (
     b"BM",                            # BMP
 )
 
-# Campos editables vía botón. (id_interno, etiqueta visible).
-# `estado` y `es_comprobante` no están aquí: tienen sus propios botones de acción rápida.
-EDITABLE_FIELDS: list[tuple[str, str]] = [
-    ("banco", "Banco"),
-    ("codigo_transaccion", "Código"),
-    ("destino_nombre", "Destino: Nombre"),
-    ("destino_numero", "Destino: Número"),
-    ("destino_tipo", "Destino: Tipo"),
-    ("valor", "Valor"),
-    ("moneda", "Moneda"),
-    ("fecha_comprobante", "Fecha comprobante"),
-    ("notas_ocr", "Notas OCR"),
-]
-
-# Orden de ciclado del botón "🔁 Estado".
-_STATE_CYCLE = [
-    EstadoTransaccion.EXITOSA,
-    EstadoTransaccion.PENDIENTE,
-    EstadoTransaccion.FALLIDA,
-]
-
-
 def _looks_like_image(data: bytes) -> bool:
     if len(data) < 12:
         return False
@@ -95,7 +73,6 @@ class PendingReview:
     """Revisión pendiente de aprobación por un admin.
 
     Vive en memoria (`BotApp._reviews`) — se pierde si el bot se reinicia.
-    `tx` se muta vía botones/edición; al aceptar se escribe a Sheets.
     Conservamos `image_bytes` para no re-descargar de Telegram al subir a R2.
     """
 
@@ -111,8 +88,6 @@ class PendingReview:
     image_ref: str
     image_bytes: bytes | None = None
     review_message_id: int | None = None
-    awaiting_edit_field: str | None = None
-    awaiting_edit_admin_id: int | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -382,6 +357,7 @@ class BotApp:
                 sender=sender_display,
                 when=when,
                 image_link=link,
+                approved_by="(bypass)",
             )
             return "auto_written"
 
@@ -476,16 +452,9 @@ class BotApp:
     # ------------------------------- rendering de tarjeta -------------------------------
 
     def _render_card(self, r: PendingReview) -> tuple[str, InlineKeyboardMarkup]:
-        """Texto HTML + teclado inline. Si está en awaiting_edit, muestra prompt y solo Cancelar."""
+        """Tarjeta compacta: estado + valor + fecha. 3 botones: Aceptar / Rechazar / Revisar."""
         tx = r.tx
         h = html.escape
-
-        es_comp_icon = "✅" if tx.es_comprobante else "⚠️"
-        es_comp_label = "Sí" if tx.es_comprobante else "<b>NO</b>"
-
-        sender_line = h(r.sender_full_name)
-        if r.sender_username:
-            sender_line += f" (@{h(r.sender_username)})"
 
         try:
             valor_fmt = f"{tx.valor:,.0f}".replace(",", ".")
@@ -493,73 +462,21 @@ class BotApp:
             valor_fmt = str(tx.valor)
 
         lines = [
-            f"{es_comp_icon} <b>Revisión pendiente</b>  <code>#{r.review_id}</code>",
-            f"<i>De:</i> {sender_line}",
-            f"<i>Hora:</i> {h(r.photo_date.strftime('%Y-%m-%d %H:%M'))}",
-            "",
-            f"<b>Banco:</b> {h(tx.banco)}",
+            f"📋 <b>Revisión</b>  <code>#{r.review_id}</code>",
             f"<b>Estado:</b> {h(tx.estado.value)}",
-            f"<b>Código:</b> {h(tx.codigo_transaccion)}",
-            f"<b>Destino:</b> {h(tx.destino_nombre)}",
-            f"   ↳ N°: <code>{h(tx.destino_numero)}</code>",
-            f"   ↳ Tipo: {h(tx.destino_tipo.value)}",
             f"<b>Valor:</b> {valor_fmt} {h(tx.moneda)}",
-            f"<b>Fecha comp.:</b> {h(tx.fecha_comprobante or '—')}",
-            f"<b>¿Es comprobante?:</b> {es_comp_label}",
+            f"<b>Fecha:</b> {h(tx.fecha_comprobante or r.photo_date.strftime('%Y-%m-%d %H:%M'))}",
         ]
-        if tx.notas_ocr:
-            lines.append("")
-            lines.append(f"<i>OCR: {h(tx.notas_ocr)}</i>")
-
-        if r.awaiting_edit_field:
-            label = self._field_label(r.awaiting_edit_field)
-            lines.append("")
-            lines.append(
-                f"✏️ <b>Editando «{h(label)}»</b> — el admin que pulsó debe enviar el "
-                f"nuevo valor como mensaje en este chat. Pulsa Cancelar para abortar."
-            )
-            kb = [[InlineKeyboardButton("❌ Cancelar edición", callback_data=f"cnc:{r.review_id}")]]
-            return "\n".join(lines), InlineKeyboardMarkup(kb)
 
         rid = r.review_id
         kb = [
             [
                 InlineKeyboardButton("✅ Aceptar", callback_data=f"acc:{rid}"),
                 InlineKeyboardButton("❌ Rechazar", callback_data=f"rej:{rid}"),
+                InlineKeyboardButton("🟣 Revisar", callback_data=f"rev:{rid}"),
             ],
-            [
-                InlineKeyboardButton("🔁 Estado", callback_data=f"cyc:{rid}"),
-                InlineKeyboardButton(
-                    "📌 Es comp: " + ("Sí→No" if tx.es_comprobante else "No→Sí"),
-                    callback_data=f"tog:{rid}",
-                ),
-            ],
-            [InlineKeyboardButton("✏️ Editar campo", callback_data=f"edt:{rid}")],
         ]
         return "\n".join(lines), InlineKeyboardMarkup(kb)
-
-    def _render_edit_menu(self, r: PendingReview) -> InlineKeyboardMarkup:
-        """Teclado del submenú de edición: un botón por campo + volver."""
-        rid = r.review_id
-        rows: list[list[InlineKeyboardButton]] = []
-        # 2 botones por fila
-        buf: list[InlineKeyboardButton] = []
-        for fid, label in EDITABLE_FIELDS:
-            buf.append(InlineKeyboardButton(label, callback_data=f"efld:{rid}:{fid}"))
-            if len(buf) == 2:
-                rows.append(buf)
-                buf = []
-        if buf:
-            rows.append(buf)
-        rows.append([InlineKeyboardButton("⬅️ Volver", callback_data=f"bck:{rid}")])
-        return InlineKeyboardMarkup(rows)
-
-    @staticmethod
-    def _field_label(field_id: str) -> str:
-        for fid, label in EDITABLE_FIELDS:
-            if fid == field_id:
-                return label
-        return field_id
 
     # ------------------------------- callback handlers -------------------------------
 
@@ -572,10 +489,9 @@ class BotApp:
             await q.answer("Solo administradores pueden revisar.", show_alert=True)
             return
 
-        parts = q.data.split(":", 2)
+        parts = q.data.split(":", 1)
         action = parts[0]
         rid = parts[1] if len(parts) > 1 else None
-        extra = parts[2] if len(parts) > 2 else None
 
         if not rid:
             await q.answer()
@@ -595,21 +511,8 @@ class BotApp:
             await self._accept_review(q, r, user)
         elif action == "rej":
             await self._reject_review(q, r, user)
-        elif action == "cyc":
-            await self._cycle_state(q, r)
-        elif action == "tog":
-            await self._toggle_comprobante(q, r)
-        elif action == "edt":
-            await self._show_edit_menu(q, r)
-        elif action == "bck":
-            await self._show_main_card(q, r)
-        elif action == "efld":
-            if not extra:
-                await q.answer()
-                return
-            await self._start_field_edit(q, r, extra, user)
-        elif action == "cnc":
-            await self._cancel_field_edit(q, r)
+        elif action == "rev":
+            await self._mark_for_revision(q, r, user)
         else:
             await q.answer("Acción desconocida")
 
@@ -618,7 +521,7 @@ class BotApp:
             f"{r.sender_full_name} (@{r.sender_username})"
             if r.sender_username else r.sender_full_name
         )
-        # Subir a R2 con los datos actuales (posiblemente editados) del tx.
+        # Subir a R2 con los datos actuales del tx.
         link = await self._upload_or_fallback(
             r.image_bytes, r.photo_date, r.tx, r.photo_message_id, r.image_ref,
         )
@@ -630,6 +533,7 @@ class BotApp:
                 sender=sender_display,
                 when=r.photo_date,
                 image_link=link,
+                approved_by=self._admin_display(admin_user),
             )
         except Exception as e:
             logger.error("Error escribiendo a Sheets para review %s: %s", r.review_id, e)
@@ -666,69 +570,48 @@ class BotApp:
             logger.warning("No pude editar mensaje de review %s: %s", r.review_id, e)
         logger.info("Review %s RECHAZADA por user=%s", r.review_id, admin_user.id)
 
-    async def _cycle_state(self, q, r: PendingReview) -> None:
+    async def _mark_for_revision(self, q, r: PendingReview, admin_user) -> None:
+        """Acepta la fila pero forzando estado=Revisión (color púrpura en Sheets).
+        Útil cuando el admin no está seguro y quiere revisar manualmente en la sheet
+        después, en lugar de aceptar/rechazar definitivamente.
+        """
+        r.tx.estado = EstadoTransaccion.REVISION
+        sender_display = (
+            f"{r.sender_full_name} (@{r.sender_username})"
+            if r.sender_username else r.sender_full_name
+        )
+        link = await self._upload_or_fallback(
+            r.image_bytes, r.photo_date, r.tx, r.photo_message_id, r.image_ref,
+        )
         try:
-            idx = _STATE_CYCLE.index(r.tx.estado)
-        except ValueError:
-            idx = -1  # estado fuera del ciclo → arrancar desde el primero
-        r.tx.estado = _STATE_CYCLE[(idx + 1) % len(_STATE_CYCLE)]
-        await q.answer(f"Estado → {r.tx.estado.value}")
-        await self._refresh_card(q, r)
-
-    async def _toggle_comprobante(self, q, r: PendingReview) -> None:
-        r.tx.es_comprobante = not r.tx.es_comprobante
-        await q.answer(f"es_comprobante → {r.tx.es_comprobante}")
-        await self._refresh_card(q, r)
-
-    async def _show_edit_menu(self, q, r: PendingReview) -> None:
-        if r.awaiting_edit_field:
-            await q.answer("Hay una edición en curso. Cancela primero.", show_alert=True)
-            return
-        await q.answer()
-        kb = self._render_edit_menu(r)
-        try:
-            await q.edit_message_reply_markup(reply_markup=kb)
+            await asyncio.to_thread(
+                self.sheets.append_transaction,
+                r.tx,
+                message_id=r.photo_message_id,
+                sender=sender_display,
+                when=r.photo_date,
+                image_link=link,
+                approved_by=self._admin_display(admin_user),
+            )
         except Exception as e:
-            logger.warning("No pude mostrar edit menu: %s", e)
-
-    async def _show_main_card(self, q, r: PendingReview) -> None:
-        await q.answer()
-        await self._refresh_card(q, r)
-
-    async def _start_field_edit(self, q, r: PendingReview, field_id: str, admin_user) -> None:
-        if field_id not in {fid for fid, _ in EDITABLE_FIELDS}:
-            await q.answer("Campo desconocido", show_alert=True)
+            logger.error("Error escribiendo a Sheets (Revisión) para review %s: %s", r.review_id, e)
+            await q.answer(f"Error guardando: {self._friendly_error(e)}", show_alert=True)
             return
-        if r.awaiting_edit_field:
-            await q.answer("Ya hay una edición en curso.", show_alert=True)
-            return
-        r.awaiting_edit_field = field_id
-        r.awaiting_edit_admin_id = admin_user.id
 
-        hint = self._field_input_hint(field_id, r.tx)
-        await q.answer(hint, show_alert=True)
-        await self._refresh_card(q, r)
-        logger.info("Review %s: admin=%s edita campo '%s'",
-                    r.review_id, admin_user.id, field_id)
+        async with self._reviews_lock:
+            self._reviews.pop(r.review_id, None)
 
-    async def _cancel_field_edit(self, q, r: PendingReview) -> None:
-        if not r.awaiting_edit_field:
-            await q.answer()
-            await self._refresh_card(q, r)
-            return
-        r.awaiting_edit_field = None
-        r.awaiting_edit_admin_id = None
-        await q.answer("Edición cancelada.")
-        await self._refresh_card(q, r)
-
-    async def _refresh_card(self, q, r: PendingReview) -> None:
-        text, kb = self._render_card(r)
+        admin_name = self._admin_display(admin_user)
+        await q.answer("Marcada para revisión.")
         try:
-            await q.edit_message_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+            await q.edit_message_text(
+                self._closing_text(r, "🟣", f"En revisión por {admin_name}"),
+                reply_markup=None,
+                parse_mode=ParseMode.HTML,
+            )
         except Exception as e:
-            # Telegram lanza BadRequest "message is not modified" si nada cambió — ignorable.
-            if "not modified" not in str(e).lower():
-                logger.warning("No pude refrescar tarjeta %s: %s", r.review_id, e)
+            logger.warning("No pude editar mensaje de review %s: %s", r.review_id, e)
+        logger.info("Review %s marcada REVISIÓN por user=%s", r.review_id, admin_user.id)
 
     @staticmethod
     def _admin_display(user) -> str:
@@ -743,117 +626,6 @@ class BotApp:
         """Mensaje final cuando la review se cierra — solo línea de status + admin + ID."""
         return f"{icon} <b>{html.escape(action_line)}</b>  <code>#{r.review_id}</code>"
 
-    # ------------------------------- edición de campo (texto) -------------------------------
-
-    @staticmethod
-    def _field_input_hint(field_id: str, tx: Transaccion) -> str:
-        """Hint corto que se muestra en answer_callback (max ~200 chars)."""
-        if field_id == "valor":
-            return f"Envía el nuevo VALOR (número, ej. 250000). Actual: {tx.valor}"
-        if field_id == "destino_tipo":
-            opts = " / ".join(t.value for t in TipoCuenta)
-            return f"Envía el TIPO de cuenta. Opciones: {opts}. Actual: {tx.destino_tipo.value}"
-        if field_id == "moneda":
-            return f"Envía la MONEDA (ej. COP, USD). Actual: {tx.moneda}"
-        label = BotApp._field_label(field_id)
-        current = getattr(tx, field_id, "") or "—"
-        return f"Envía el nuevo valor para «{label}». Actual: {current}"
-
-    @staticmethod
-    def _apply_field_edit(tx: Transaccion, field_id: str, raw: str) -> None:
-        """Muta tx in-place. Lanza ValueError con mensaje user-facing si el input es inválido."""
-        value = raw.strip()
-        if not value:
-            raise ValueError("Vacío")
-
-        if field_id == "valor":
-            # quitar símbolos comunes ($, espacios, separadores de miles . o ,)
-            cleaned = (
-                value.replace("$", "").replace(" ", "")
-                .replace(".", "").replace(",", "")
-            )
-            try:
-                tx.valor = float(cleaned)
-            except ValueError:
-                raise ValueError(f"'{value}' no es un número")
-            return
-
-        if field_id == "destino_tipo":
-            # case-insensitive match contra enum
-            for t in TipoCuenta:
-                if t.value.lower() == value.lower():
-                    tx.destino_tipo = t
-                    return
-            opts = ", ".join(t.value for t in TipoCuenta)
-            raise ValueError(f"Tipo inválido. Opciones: {opts}")
-
-        if field_id in {
-            "banco", "codigo_transaccion", "destino_nombre", "destino_numero",
-            "moneda", "fecha_comprobante", "notas_ocr",
-        }:
-            setattr(tx, field_id, value)
-            return
-
-        raise ValueError(f"Campo no editable: {field_id}")
-
-    async def handle_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """Recibe el mensaje de texto con el nuevo valor de un campo en edición.
-        Solo aplica si el sender es admin y tiene una review con awaiting_edit_admin_id=su id
-        en el mismo chat. Si no, no-op (no rompe otros usos del chat).
-        """
-        msg = update.effective_message
-        if msg is None or not msg.text:
-            return
-        user = msg.from_user
-        chat = msg.chat
-        if user is None or not self._is_admin(user.id):
-            return
-        if not self._chat_allowed(chat.id):
-            return
-
-        async with self._reviews_lock:
-            target = next(
-                (r for r in self._reviews.values()
-                 if r.chat_id == chat.id
-                 and r.awaiting_edit_admin_id == user.id
-                 and r.awaiting_edit_field),
-                None,
-            )
-        if target is None:
-            return  # nada que hacer — texto normal del admin
-
-        field_id = target.awaiting_edit_field
-        try:
-            self._apply_field_edit(target.tx, field_id, msg.text)
-        except ValueError as e:
-            await msg.reply_text(f"❌ Valor inválido: {e}\nReenvía el mensaje o pulsa Cancelar.")
-            return
-
-        target.awaiting_edit_field = None
-        target.awaiting_edit_admin_id = None
-
-        # Re-render
-        text, kb = self._render_card(target)
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=target.chat_id,
-                message_id=target.review_message_id,
-                text=text,
-                reply_markup=kb,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception as e:
-            logger.warning("No pude refrescar tarjeta tras edit %s: %s", target.review_id, e)
-        try:
-            await msg.reply_text(
-                f"✏️ <b>{html.escape(self._field_label(field_id))}</b> actualizado.",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-        logger.info("Review %s: campo '%s' editado por user=%s",
-                    target.review_id, field_id, user.id)
-
     # ------------------------------- build / main -------------------------------
 
     def build(self) -> Application:
@@ -863,9 +635,6 @@ class BotApp:
         app.add_handler(CommandHandler("bypass", self.cmd_bypass))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         app.add_handler(CallbackQueryHandler(self.handle_callback))
-        # Texto plano (NO comando) en chats permitidos — sólo se aplica si el sender
-        # es admin con una edición pendiente. Cualquier otro texto se ignora.
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
         return app
 
 
