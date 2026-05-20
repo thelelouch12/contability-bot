@@ -156,8 +156,10 @@ class SheetsClient:
                     pass
 
     def _migrate_add_aprobado_column(self, existing: dict) -> None:
-        """Agrega la columna 'Aprobado por' (R) a transactions sheets si no existe.
-        Idempotente: si el header de R ya dice 'Aprobado por', no hace nada."""
+        """Agrega la columna 'Aprobado por' (R) a transactions sheets.
+        Idempotente: si el header de R ya dice 'Aprobado por', solo limpia
+        dataValidation BOOLEAN si quedó en filas (caso del bug de las filas
+        que aparecían como checkbox antes del fix)."""
         import re as _re
         _monthly_re = _re.compile(r"^\d{4}-\d{2}$")
         target_col_letter = "R"
@@ -168,25 +170,47 @@ class SheetsClient:
                 current = ws.acell(f"{target_col_letter}1").value
             except Exception:
                 current = None
-            if current == "Aprobado por":
-                continue
-            logger.info("Migración: agregando columna 'Aprobado por' en '%s'", title)
-            # Asegurar que el sheet tenga >= len(HEADERS) columnas
-            if ws.col_count < len(HEADERS):
-                ws.add_cols(len(HEADERS) - ws.col_count)
-            ws.update(values=[["Aprobado por"]], range_name=f"{target_col_letter}1",
-                      value_input_option="USER_ENTERED")
             gid = ws.id
-            self._sh.batch_update({"requests": [
-                self._repeat_cell(gid, 0, 1, COL_APROBADO_IDX, COL_APROBADO_IDX + 1,
-                                  HEADER_FMT, "userEnteredFormat"),
-                {"updateDimensionProperties": {
-                    "range": {"sheetId": gid, "dimension": "COLUMNS",
-                              "startIndex": COL_APROBADO_IDX, "endIndex": COL_APROBADO_IDX + 1},
-                    "properties": {"pixelSize": 160},
-                    "fields": "pixelSize",
+            needs_header = current != "Aprobado por"
+            requests = []
+            if needs_header:
+                logger.info("Migración: agregando header 'Aprobado por' en '%s'", title)
+                if ws.col_count < len(HEADERS):
+                    ws.add_cols(len(HEADERS) - ws.col_count)
+                ws.update(values=[["Aprobado por"]], range_name=f"{target_col_letter}1",
+                          value_input_option="USER_ENTERED")
+                requests += [
+                    self._repeat_cell(gid, 0, 1, COL_APROBADO_IDX, COL_APROBADO_IDX + 1,
+                                      HEADER_FMT, "userEnteredFormat"),
+                    {"updateDimensionProperties": {
+                        "range": {"sheetId": gid, "dimension": "COLUMNS",
+                                  "startIndex": COL_APROBADO_IDX, "endIndex": COL_APROBADO_IDX + 1},
+                        "properties": {"pixelSize": 160},
+                        "fields": "pixelSize",
+                    }},
+                ]
+
+            # SIEMPRE limpiar dataValidation y boolValues False en col R rows 2+:
+            # arregla filas que quedaron como checkbox porque Sheets extiende dv al
+            # appendear (heredan del rango definido en otra migración o auto-fill).
+            row_max = max(ws.row_count, 1000)
+            requests += [
+                {"setDataValidation": {
+                    "range": {"sheetId": gid, "startRowIndex": 1, "endRowIndex": row_max,
+                              "startColumnIndex": COL_APROBADO_IDX, "endColumnIndex": COL_APROBADO_IDX + 1},
+                    # sin "rule" → elimina la data validation existente
                 }},
-            ]})
+                # Limpiar boolValues residuales en col R: filas con TRUE/FALSE de checkbox
+                # heredado se reemplazan por celda vacía (string blank).
+                {"repeatCell": {
+                    "range": {"sheetId": gid, "startRowIndex": 1, "endRowIndex": row_max,
+                              "startColumnIndex": COL_APROBADO_IDX, "endColumnIndex": COL_APROBADO_IDX + 1},
+                    "cell": {"userEnteredValue": {"stringValue": ""}},
+                    "fields": "userEnteredValue",
+                }},
+            ]
+            if requests:
+                self._sh.batch_update({"requests": requests})
 
     def _migrate_add_revision_color(self, existing: dict) -> None:
         """Idempotente: agrega regla 'Revisión' → púrpura a cada hoja transactions
